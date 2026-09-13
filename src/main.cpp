@@ -601,7 +601,7 @@ void starParallaxEffect() {
 void handleMenu() {
 const int totalMenuOptions = 4;
 
-  // Inicializar estrellas del menú la primera vez
+  // Inicializar estrellas la primera vez
   if (!starsInitialized) {
     for (int i = 0; i < MENU_STARS; i++) {
       mStarX[i] = random(0, SCREEN_WIDTH);
@@ -652,7 +652,7 @@ const int totalMenuOptions = 4;
   // --- 3. RENDERIZADO VISUAL ---
   oledMonitor.clearDisplay();
 
-  // A. Fondo Parallax (Estrellas)
+  // A. Fondo Parallax
   for (int i = 0; i < MENU_STARS; i++) {
     mStarX[i] -= mStarSpeed[i];
     if (mStarX[i] < 0) {
@@ -669,38 +669,42 @@ const int totalMenuOptions = 4;
   oledMonitor.print("PINPONG");
   
   oledMonitor.setCursor(100, 2);
-  oledMonitor.print("v2.0");
+  oledMonitor.print("v1.0");
   oledMonitor.drawFastHLine(0, 11, 128, WHITE);
 
-  // C. Renderizado de Opciones con Iconos 7x7
+  // C. Cálculo de Animación de Respiración para el Cursor
+  int animOffset = abs((int)(millis() / 120) % 4 - 2); // Oscila entre 0, 1, 2
+
+  // D. Renderizado de Opciones con Iconos y Flecha Animada
   const char* options[4] = {"JUGAR", "CONFIGURACION", "CREDITOS", "SALIR"};
   
   for (int i = 0; i < totalMenuOptions; i++) {
-    int yPos = 15 + (i * 12); // Posiciones Y: 15, 27, 39, 51
+    int yPos = 15 + (i * 12);
     
     if (i == currentMenuOption) {
-      // CAJA SELECCIONADA: Fondo blanco, texto e icono en negro
-      oledMonitor.fillRoundRect(6, yPos - 1, 116, 10, 2, WHITE);
+      // 1. FLECHA ANIMADA QUE "RESPIRA" (Se mueve entre X=0 y X=2)
+      oledMonitor.setTextColor(WHITE);
+      oledMonitor.setCursor(0 + animOffset, yPos);
+      oledMonitor.print(">");
+
+      // 2. CAJA SELECCIONADA (Ajustada a X=8 para dar espacio a la flecha)
+      oledMonitor.fillRoundRect(8, yPos - 1, 114, 10, 2, WHITE);
       
-      // Dibujar Icono en NEGRO dentro de la caja blanca
-      oledMonitor.drawBitmap(10, yPos, menuIcons[i], 7, 7, BLACK);
-      
-      // Dibujar Texto en NEGRO
+      // 3. ICONO Y TEXTO EN NEGRO
+      oledMonitor.drawBitmap(12, yPos, menuIcons[i], 7, 7, BLACK);
       oledMonitor.setTextColor(BLACK); 
-      oledMonitor.setCursor(22, yPos);
+      oledMonitor.setCursor(23, yPos);
       oledMonitor.print(options[i]);
     } else {
-      // OPCIÓN NORMAL: Icono y texto en blanco sobre fondo negro
-      oledMonitor.drawBitmap(10, yPos, menuIcons[i], 7, 7, WHITE);
-      
+      // OPCIÓN NORMAL
+      oledMonitor.drawBitmap(12, yPos, menuIcons[i], 7, 7, WHITE);
       oledMonitor.setTextColor(WHITE);
-      oledMonitor.setCursor(22, yPos);
+      oledMonitor.setCursor(23, yPos);
       oledMonitor.print(options[i]);
     }
   }
 
   oledMonitor.display();
-
 }
 
 
