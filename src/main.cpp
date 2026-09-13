@@ -45,6 +45,7 @@ enum GameState {
   STATE_SETTINGS,
   STATE_CREDITS,
   STATE_SLEEP,
+  STATE_ATTRACT // Nuevo: Modo Demostración
 };
 
 GameState currentState = STATE_MENU; // El juego inicia en el menú
@@ -80,6 +81,12 @@ bool starsInitialized = false;
 
 //animacion barra deslizante
 int animOffset = abs((int)(millis() / 120) % 4 - 2);
+
+// Temporizador de Inactividad para Attract Mode
+unsigned long lastActivityTime = 0; 
+const unsigned long INACTIVITY_TIMEOUT = 15000; // 15000 ms = 15 segundos
+
+
 
 
 // ==========================================
@@ -158,6 +165,7 @@ void starParallaxEffect();
 //funciones demenu
 void handleMenu();
 void handleSleep();
+void handleAttractMode();
 
 
 /**
@@ -193,20 +201,24 @@ switch (currentState) {
       handleMenu();
       break;
     
+    case STATE_ATTRACT:
+      handleAttractMode();
+      break;
+
     case STATE_PLAY:
-      // Próximo paso: Lógica del Ping Pong
+      // Código de juego principal
       break;
       
     case STATE_SETTINGS:
-      // Submenú de Ajustes
+      // Configuración
       break;
 
     case STATE_CREDITS:
-      // Pantalla de Créditos
+      // Créditos
       break;
 
     case STATE_SLEEP:
-       handleSleep();
+      handleSleep();
       break;
   }
 }
@@ -619,12 +631,14 @@ const int totalMenuOptions = 4;
     if (currentMenuOption < 0) currentMenuOption = totalMenuOptions - 1; 
     tone(BUZZER_PIN, 1200, 15); 
     joystickLocked = true;
+    lastActivityTime = millis(); // REINICIAR TEMPORIZADOR
   }
   else if (joyY > 3000 && !joystickLocked) {
     currentMenuOption++;
     if (currentMenuOption >= totalMenuOptions) currentMenuOption = 0; 
     tone(BUZZER_PIN, 1000, 15); 
     joystickLocked = true;
+    lastActivityTime = millis(); // REINICIAR TEMPORIZADOR
   }
   else if (joyY > 1500 && joyY < 2500) {
     joystickLocked = false; 
@@ -633,6 +647,7 @@ const int totalMenuOptions = 4;
   // --- 2. SELECCIÓN CON BOTÓN ---
   if (digitalRead(J1_BTN_PIN) == LOW && millis() - lastBtnPress > 300) {
     lastBtnPress = millis();
+    lastActivityTime = millis(); // REINICIAR TEMPORIZADOR
     
     tone(BUZZER_PIN, 1500, 40);
     delay(40);
@@ -704,6 +719,15 @@ const int totalMenuOptions = 4;
     }
   }
 
+
+  if (millis() - lastActivityTime > INACTIVITY_TIMEOUT) {
+    currentState = STATE_ATTRACT;
+    oledMonitor.clearDisplay();
+    oledMonitor.display();
+    return;
+  }
+
+
   oledMonitor.display();
 }
 
@@ -747,4 +771,109 @@ void handleSleep() {
   
   // Entrar en modo Deep Sleep (Ahorro de energía total)
   esp_deep_sleep_start();
+}
+
+
+// ==========================================
+//   MODO DEMOSTRACIÓN (ATTRACT MODE - IA vs IA)
+// ==========================================
+void handleAttractMode() {
+  // Variables estáticas para mantener el estado de la partida demo
+  static float ballX = 64, ballY = 32;
+  static float ballDX = 2.5, ballDY = 1.8;
+  static float paddle1Y = 24, paddle2Y = 24;
+  const int paddleH = 14, paddleW = 2;
+  static unsigned long blinkTimer = 0;
+  static bool showText = true;
+
+  // --- 1. COMPROBAR ENTRADA DE USUARIO (INTERRUPCIÓN) ---
+  int joyY = analogRead(J1_Y_PIN);
+  bool btnPressed = (digitalRead(J1_BTN_PIN) == LOW);
+
+  // Si el usuario mueve el joystick o presiona el botón, regresa al menú
+  if (joyY < 1000 || joyY > 3000 || btnPressed) {
+    lastActivityTime = millis(); // Reset del cronómetro de inactividad
+    currentState = STATE_MENU;
+    tone(BUZZER_PIN, 800, 30);
+    delay(150); // Evitar falsas lecturas
+    return;
+  }
+
+  // --- 2. LÓGICA DE FÍSICA Y DOS INTELIGENCIAS ARTIFICIALES ---
+  ballX += ballDX;
+  ballY += ballDY;
+
+  // IA Paleta Izquierda (Sigue la pelota con suavidad)
+  if (ballX < 70) {
+    if (paddle1Y + (paddleH / 2) < ballY) paddle1Y += 1.5;
+    if (paddle1Y + (paddleH / 2) > ballY) paddle1Y -= 1.5;
+  }
+
+  // IA Paleta Derecha (Sigue la pelota con suavidad)
+  if (ballX > 58) {
+    if (paddle2Y + (paddleH / 2) < ballY) paddle2Y += 1.5;
+    if (paddle2Y + (paddleH / 2) > ballY) paddle2Y -= 1.5;
+  }
+
+  // Limitar paletas dentro de la pantalla
+  paddle1Y = constrain(paddle1Y, 0, SCREEN_HEIGHT - paddleH);
+  paddle2Y = constrain(paddle2Y, 0, SCREEN_HEIGHT - paddleH);
+
+  // Rebotes en paredes superior e inferior
+  if (ballY <= 0 || ballY >= SCREEN_HEIGHT - 2) {
+    ballDY *= -1;
+    tone(BUZZER_PIN, 600, 10);
+  }
+
+  // Rebote Paleta Izquierda
+  if (ballX <= (4 + paddleW) && ballY >= paddle1Y && ballY <= paddle1Y + paddleH) {
+    ballDX *= -1;
+    ballX = 4 + paddleW + 1;
+    tone(BUZZER_PIN, 900, 15);
+  }
+
+  // Rebote Paleta Derecha
+  if (ballX >= (124 - paddleW) && ballY >= paddle2Y && ballY <= paddle2Y + paddleH) {
+    ballDX *= -1;
+    ballX = 124 - paddleW - 1;
+    tone(BUZZER_PIN, 900, 15);
+  }
+
+  // Reset de pelota si se marca punto en la demo
+  if (ballX < 0 || ballX > SCREEN_WIDTH) {
+    ballX = 64;
+    ballY = 32;
+    ballDX = (random(0, 2) == 0 ? 2.5 : -2.5);
+  }
+
+  // --- 3. RENDERIZADO VISUAL ---
+  oledMonitor.clearDisplay();
+
+  // Campo de juego (Línea central punteada)
+  for (int y = 0; y < SCREEN_HEIGHT; y += 6) {
+    oledMonitor.drawFastVLine(64, y, 3, WHITE);
+  }
+
+  // Dibujar Paletas y Pelota
+  oledMonitor.fillRect(4, (int)paddle1Y, paddleW, paddleH, WHITE);
+  oledMonitor.fillRect(124 - paddleW, (int)paddle2Y, paddleW, paddleH, WHITE);
+  oledMonitor.fillRect((int)ballX, (int)ballY, 2, 2, WHITE);
+
+  // Overlay Parpadeante Arcade ("DEMO MODE / PRESS START")
+  if (millis() - blinkTimer > 500) {
+    showText = !showText;
+    blinkTimer = millis();
+  }
+
+  if (showText) {
+    oledMonitor.fillRect(14, 26, 100, 12, BLACK); // Caja de fondo para legibilidad
+    oledMonitor.drawRect(14, 26, 100, 12, WHITE);
+    oledMonitor.setTextSize(1);
+    oledMonitor.setTextColor(WHITE);
+    oledMonitor.setCursor(18, 28);
+    oledMonitor.print("PRESS ANY BUTTON");
+  }
+
+  oledMonitor.display();
+  delay(15); // ~60 FPS
 }
