@@ -6,5 +6,4 @@
 build/
 sdkconfig
 .vscode
-include
-lib
+
