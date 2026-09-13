@@ -1,9 +1,9 @@
 /**
  * @file      PinPong_Arcade.ino
  * @author    [Tu Nombre / Arcade Studio]
- * @brief     Secuencia de inicio profesional para consola retro ESP32.
- *            Incluye físicas, partículas, screen shake, sonido de 8-bits, 
- *            música de menú en bucle y submenú de preparación de partida.
+ * @brief     Secuencia de inicio y menús para consola retro ESP32.
+ *            Incluye física de audio independiente (Música/SFX),
+ *            inversión de controles y submenú de preparación de partida.
  * @hardware  ESP32, Pantalla OLED SH1106 (I2C), Zumbador Pasivo + Transistor 2N2222.
  */
 
@@ -11,6 +11,12 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH1106.h>
+#include <Preferences.h>
+
+
+Preferences preferences;
+
+
 
 // ==========================================
 //   CONFIGURACIÓN DE HARDWARE Y PINES
@@ -41,7 +47,7 @@
 enum GameState {
   STATE_SPLASH,
   STATE_MENU,
-  STATE_MATCH_SETUP, // Submenú antes de iniciar la partida
+  STATE_MATCH_SETUP,
   STATE_PLAY,
   STATE_SETTINGS,
   STATE_CREDITS,
@@ -94,9 +100,13 @@ bool starsInitialized = false;
 unsigned long lastActivityTime = 0; 
 const unsigned long INACTIVITY_TIMEOUT = 15000; 
 
-// CONFIGURACIÓN GLOBAL Y DE PARTIDA
+// CONFIGURACIÓN GLOBAL Y DE SISTEMA
+bool musicEnabled   = true;  // Música de fondo (ON/OFF)
+bool sfxEnabled     = true;  // Efectos de sonido (ON/OFF)
+bool invertControls = false; // Inversión del eje Y del Joystick (SI/NO)
+
+// CONFIGURACIÓN DE LA PARTIDA
 int gameDifficulty = 1;   // 0: FACIL, 1: NORMAL, 2: DIFICIL
-bool soundEnabled  = true; // true: ON, false: OFF
 int gameMode       = 0;    // 0: 1P vs IA, 1: 2P VS
 int scoreLimit     = 5;    // 3, 5, 10 Puntos
 
@@ -130,11 +140,11 @@ const uint8_t* const menuIcons[] = {
 // ==========================================
 //   PROTOTIPOS DE FUNCIONES
 // ==========================================
+int readJoystickY();
 void showStudioScreen();
 void showBouncingBallAnimation();
 void showCenterExplosion();
 void showLoadingBarAnimation();
-void starParallaxEffect();
 
 void handleSplashScreen();
 void handleMenu();
@@ -145,9 +155,16 @@ void handleAttractMode();
 
 void animateScreenWipe();
 void playSFX(int frequency, int duration);
-void playSound(int frequency, int duration);
 void updateAudio();
 void stopAudio();
+
+// ==========================================
+//   HELPER DE LECTURA CON INVERSIÓN
+// ==========================================
+int readJoystickY() {
+  int rawY = analogRead(J1_Y_PIN);
+  return invertControls ? (4095 - rawY) : rawY;
+}
 
 // ==========================================
 //   SETUP Y LOOP
@@ -212,13 +229,9 @@ void loop() {
 //   SISTEMA DE AUDIO CENTRALIZADO
 // ==========================================
 void playSFX(int frequency, int duration) {
-  if (!soundEnabled) return;
+  if (!sfxEnabled) return;
   sfxEndTime = millis() + duration; 
   tone(BUZZER_PIN, frequency, duration);
-}
-
-void playSound(int frequency, int duration) {
-  playSFX(frequency, duration);
 }
 
 void stopAudio() {
@@ -226,18 +239,13 @@ void stopAudio() {
 }
 
 void updateAudio() {
-  if (!soundEnabled) {
-    stopAudio();
-    return;
-  }
-
   // 1. Si hay un efecto de sonido activo, darle prioridad
   if (millis() < sfxEndTime) {
     return; 
   }
 
-  // 2. Tocar música en el menú principal y en la preparación de partida
-  if (currentState != STATE_MENU && currentState != STATE_MATCH_SETUP) {
+  // 2. Si la música está apagada o no estamos en Menú/Setup, detener tono
+  if (!musicEnabled || (currentState != STATE_MENU && currentState != STATE_MATCH_SETUP)) {
     return;
   }
 
@@ -547,7 +555,7 @@ void handleMenu() {
   }
 
   // 1. LECTURA DEL JOYSTICK
-  int joyY = analogRead(J1_Y_PIN); 
+  int joyY = readJoystickY(); 
   
   if (joyY < 1000 && !joystickLocked) {
     currentMenuOption--;
@@ -578,7 +586,6 @@ void handleMenu() {
 
     animateScreenWipe();
 
-    // Redirección con nuevo estado de preparación de partida
     if (currentMenuOption == 0) {
       currentState = STATE_MATCH_SETUP;
       currentSetupOption = 0;
@@ -651,15 +658,14 @@ void handleMenu() {
 }
 
 // ==========================================
-//   SUBMENÚ: PREPARACIÓN DE PARTIDA (NEW)
+//   SUBMENÚ: PREPARACIÓN DE PARTIDA
 // ==========================================
 void handleMatchSetup() {
-  const int totalSetupOptions = 5; // 0: MODO, 1: DIFICULTAD, 2: PUNTOS, 3: EMPEZAR, 4: VOLVER
+  const int totalSetupOptions = 5;
 
-  int joyY = analogRead(J1_Y_PIN);
+  int joyY = readJoystickY();
   int joyX = analogRead(J1_X_PIN);
 
-  // Navegación Vertical (Arriba / Abajo)
   if (joyY < 1000 && !joystickLocked) {
     currentSetupOption--;
     if (currentSetupOption < 0) currentSetupOption = totalSetupOptions - 1;
@@ -675,21 +681,20 @@ void handleMatchSetup() {
     lastActivityTime = millis();
   }
 
-  // Modificación de Valores (Izquierda / Derecha)
   if ((joyX < 1000 || joyX > 3000) && !joystickLocked) {
     bool moveRight = (joyX > 3000);
     playSFX(1400, 20);
     lastActivityTime = millis();
 
     switch (currentSetupOption) {
-      case 0: // MODO
+      case 0:
         gameMode = (gameMode == 0) ? 1 : 0;
         break;
-      case 1: // DIFICULTAD
+      case 1:
         if (moveRight) gameDifficulty = (gameDifficulty + 1) % 3;
         else gameDifficulty = (gameDifficulty == 0) ? 2 : gameDifficulty - 1;
         break;
-      case 2: // PUNTOS MÁXIMOS
+      case 2:
         if (scoreLimit == 3) scoreLimit = 5;
         else if (scoreLimit == 5) scoreLimit = 10;
         else scoreLimit = 3;
@@ -698,12 +703,10 @@ void handleMatchSetup() {
     joystickLocked = true;
   }
 
-  // Liberar bloqueo de Joystick
   if (joyY > 1500 && joyY < 2500 && joyX > 1500 && joyX < 2500) {
     joystickLocked = false;
   }
 
-  // Pulsación del Botón
   if (digitalRead(J1_BTN_PIN) == LOW && millis() - lastBtnPress > 300) {
     lastBtnPress = millis();
     lastActivityTime = millis();
@@ -727,11 +730,11 @@ void handleMatchSetup() {
       delay(80);
       playSFX(2200, 150);
       animateScreenWipe();
-      stopAudio(); // Detener música del menú para el juego
+      stopAudio(); 
       currentState = STATE_PLAY;
       return;
     }
-    else if (currentSetupOption == 4) { // CANCELAR / VOLVER
+    else if (currentSetupOption == 4) { // CANCELAR
       playSFX(800, 40);
       animateScreenWipe();
       currentState = STATE_MENU;
@@ -739,7 +742,6 @@ void handleMatchSetup() {
     }
   }
 
-  // --- RENDERIZADO VISUAL DE PREPARACIÓN DE PARTIDA ---
   oledMonitor.clearDisplay();
 
   oledMonitor.setTextSize(1);
@@ -751,7 +753,6 @@ void handleMatchSetup() {
   const char* diffLabels[3] = {"FACIL", "NORMAL", "DIFICIL"};
   int animOffset = abs((int)(millis() / 120) % 4 - 2);
 
-  // Dibuja opciones de juego
   for (int i = 0; i < totalSetupOptions; i++) {
     int yPos = 14 + (i * 10);
 
@@ -770,7 +771,7 @@ void handleMatchSetup() {
       oledMonitor.setCursor(10, yPos);
       oledMonitor.print("DIFICULTAD:");
       oledMonitor.setCursor(80, yPos);
-      if (gameMode == 1) oledMonitor.print("[---]"); // No aplica en 2P
+      if (gameMode == 1) oledMonitor.print("[---]");
       else oledMonitor.print(diffLabels[gameDifficulty]);
     }
     else if (i == 2) {
@@ -803,12 +804,12 @@ void handleMatchSetup() {
 }
 
 // ==========================================
-//   SUBMENÚ DE CONFIGURACIÓN GLOBAL
+//   SUBMENÚ DE CONFIGURACIÓN DEL SISTEMA (ACTUALIZADO)
 // ==========================================
 void handleSettings() {
-  const int totalSettingsOptions = 2; // 0: AUDIO, 1: VOLVER
+  const int totalSettingsOptions = 4; // 0: MUSICA, 1: SFX, 2: INVERTIR, 3: VOLVER
 
-  int joyY = analogRead(J1_Y_PIN);
+  int joyY = readJoystickY();
 
   if (joyY < 1000 && !joystickLocked) {
     currentSettingOption--;
@@ -833,11 +834,20 @@ void handleSettings() {
     lastBtnPress = millis();
     lastActivityTime = millis();
 
-    if (currentSettingOption == 0) {
-      soundEnabled = !soundEnabled;
+    if (currentSettingOption == 0) { // MÚSICA DE FONDO
+      musicEnabled = !musicEnabled;
+      if (!musicEnabled) stopAudio(); 
+      else playSFX(1400, 30);
+    }
+    else if (currentSettingOption == 1) { // EFECTOS DE SONIDO
+      sfxEnabled = !sfxEnabled;
       playSFX(1400, 30);
     }
-    else if (currentSettingOption == 1) { // VOLVER AL MENÚ
+    else if (currentSettingOption == 2) { // INVERTIR CONTROLES
+      invertControls = !invertControls;
+      playSFX(1400, 30);
+    }
+    else if (currentSettingOption == 3) { // VOLVER
       playSFX(800, 40);
       animateScreenWipe();
       currentState = STATE_MENU;
@@ -855,25 +865,34 @@ void handleSettings() {
 
   int animOffset = abs((int)(millis() / 120) % 4 - 2); 
 
-  // Opción 0: AUDIO
-  int yPos0 = 22;
-  if (currentSettingOption == 0) {
-    oledMonitor.setCursor(0 + animOffset, yPos0);
-    oledMonitor.print(">");
-  }
-  oledMonitor.setCursor(10, yPos0);
-  oledMonitor.print("AUDIO SISTEMA:");
-  oledMonitor.setCursor(95, yPos0);
-  oledMonitor.print(soundEnabled ? "[ON]" : "[OFF]");
+  const char* settingNames[4] = {"MUSICA", "EFECTOS SFX", "INVERTIR Y", "< VOLVER"};
 
-  // Opción 1: VOLVER
-  int yPos1 = 38;
-  if (currentSettingOption == 1) {
-    oledMonitor.setCursor(0 + animOffset, yPos1);
-    oledMonitor.print(">");
+  for (int i = 0; i < totalSettingsOptions; i++) {
+    int yPos = 15 + (i * 11);
+
+    if (i == currentSettingOption) {
+      oledMonitor.setCursor(0 + animOffset, yPos);
+      oledMonitor.print(">");
+    }
+
+    oledMonitor.setCursor(10, yPos);
+    oledMonitor.print(settingNames[i]);
+
+    oledMonitor.setCursor(88, yPos);
+    switch (i) {
+      case 0:
+        oledMonitor.print(musicEnabled ? "[ON]" : "[OFF]");
+        break;
+      case 1:
+        oledMonitor.print(sfxEnabled ? "[ON]" : "[OFF]");
+        break;
+      case 2:
+        oledMonitor.print(invertControls ? "[SI]" : "[NO]");
+        break;
+      case 3:
+        break;
+    }
   }
-  oledMonitor.setCursor(10, yPos1);
-  oledMonitor.print("< VOLVER AL MENU");
 
   oledMonitor.display();
 }
@@ -924,7 +943,7 @@ void handleAttractMode() {
   static unsigned long blinkTimer = 0;
   static bool showText = true;
 
-  int joyY = analogRead(J1_Y_PIN);
+  int joyY = readJoystickY();
   bool btnPressed = (digitalRead(J1_BTN_PIN) == LOW);
 
   if (joyY < 1000 || joyY > 3000 || btnPressed) {
