@@ -73,7 +73,7 @@ unsigned long lastBtnPress = 0;  // Antirrebote (Debounce) del botón
 
 
 // Estrellas de fondo para el menú (Parallax)
-const int MENU_STARS = 8;
+const int MENU_STARS = 12;
 float mStarX[MENU_STARS];
 int mStarY[MENU_STARS];
 float mStarSpeed[MENU_STARS];
@@ -169,6 +169,7 @@ void handleSplashScreen();
 void handleMenu();
 void handleSleep();
 void handleAttractMode();
+void animateScreenWipe();
 
 
 /**
@@ -654,11 +655,16 @@ const int totalMenuOptions = 4;
   // --- 2. SELECCIÓN CON BOTÓN ---
   if (digitalRead(J1_BTN_PIN) == LOW && millis() - lastBtnPress > 300) {
     lastBtnPress = millis();
-    lastActivityTime = millis(); // REINICIAR TEMPORIZADOR
-    
+    lastActivityTime = millis(); // Reiniciar temporizador de inactividad
+
     tone(BUZZER_PIN, 1500, 40);
     delay(40);
     tone(BUZZER_PIN, 2000, 100);
+
+    // 🎬 ¡AQUÍ EJECUTAMOS LA TRANSICIÓN SUAVE!
+    animateScreenWipe();
+
+
     
     if (currentMenuOption == 0) currentState = STATE_PLAY;
     if (currentMenuOption == 1) currentState = STATE_SETTINGS;
@@ -937,3 +943,20 @@ void handleSplashScreen() {
   lastActivityTime = millis(); // Reinicia el temporizador de inactividad (Attract Mode)
 }
 
+// ==========================================
+//   TRANSICIÓN SUAVE ENTRE PANTALLAS (WIPE)
+// ==========================================
+void animateScreenWipe() {
+  // 1. Barrido de cortina blanca de izquierda a derecha
+  for (int x = 0; x <= 128; x += 10) {
+    oledMonitor.fillRect(0, 0, x, 64, WHITE);
+    oledMonitor.display();
+    delay(5); // Controla la velocidad de la cortina
+  }
+  
+  delay(40); // Pequeña pausa visual con la pantalla cubierta
+
+  // 2. Limpieza total para dar paso a la nueva pantalla
+  oledMonitor.clearDisplay();
+  oledMonitor.display();
+}
