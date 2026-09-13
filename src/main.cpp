@@ -40,15 +40,17 @@
 //   MÁQUINA DE ESTADOS DEL JUEGO
 // ==========================================
 enum GameState {
+  STATE_SPLASH, // Nuevo: Modo Demostración
   STATE_MENU,
   STATE_PLAY,
   STATE_SETTINGS,
   STATE_CREDITS,
   STATE_SLEEP,
-  STATE_ATTRACT // Nuevo: Modo Demostración
+  STATE_ATTRACT,
+ 
 };
 
-GameState currentState = STATE_MENU; // El juego inicia en el menú
+GameState currentState = STATE_MENU; // El juego inicia en la pantalla de bienvenida
 
 
 
@@ -163,6 +165,7 @@ void showCenterExplosion();
 void showLoadingBarAnimation();
 void starParallaxEffect();
 //funciones demenu
+void handleSplashScreen();
 void handleMenu();
 void handleSleep();
 void handleAttractMode();
@@ -197,20 +200,24 @@ void setup() {
  */
 void loop() {
 switch (currentState) {
+   case STATE_SPLASH:
+      handleSplashScreen();
+      break;
+
     case STATE_MENU:
       handleMenu();
       break;
-    
+
     case STATE_ATTRACT:
       handleAttractMode();
       break;
 
     case STATE_PLAY:
-      // Código de juego principal
+      // Próxima sección: Lógica del juego
       break;
-      
+
     case STATE_SETTINGS:
-      // Configuración
+      // Ajustes
       break;
 
     case STATE_CREDITS:
@@ -877,3 +884,56 @@ void handleAttractMode() {
   oledMonitor.display();
   delay(15); // ~60 FPS
 }
+
+
+// ==========================================
+//   PANTALLA DE CARGA / SPLASH SCREEN
+// ==========================================
+void handleSplashScreen() {
+  // A. Animación: El título cae desde arriba
+  for (int y = -16; y <= 6; y += 2) {
+    oledMonitor.clearDisplay();
+    
+    oledMonitor.setTextSize(2);
+    oledMonitor.setTextColor(WHITE);
+    oledMonitor.setCursor(22, y);
+    oledMonitor.print("PINPONG");
+    
+    oledMonitor.display();
+    delay(10);
+  }
+
+  // B. Chime de Audio Retro (Estilo GameBoy / Arcade)
+  tone(BUZZER_PIN, 987, 80);   // Nota B5
+  delay(90);
+  tone(BUZZER_PIN, 1318, 220); // Nota E6
+  delay(220);
+  noTone(BUZZER_PIN);
+
+  // C. Subtítulo y Marco Decorativo
+  oledMonitor.drawFastHLine(14, 25, 100, WHITE);
+  
+  oledMonitor.setTextSize(1);
+  oledMonitor.setTextColor(WHITE);
+  oledMonitor.setCursor(26, 31);
+  oledMonitor.print("RETRO CONSOLE");
+
+  oledMonitor.setCursor(31, 44);
+  oledMonitor.print("CARGANDO...");
+
+  // D. Barra de Carga Animada (Pixel-Art)
+  oledMonitor.drawRect(24, 55, 80, 6, WHITE); // Borde exterior
+  
+  for (int w = 0; w <= 76; w += 4) {
+    oledMonitor.fillRect(26, 57, w, 2, WHITE); // Relleno progresivo
+    oledMonitor.display();
+    delay(25); // Controla la velocidad de carga
+  }
+
+  delay(400); // Pausa visual con la barra llena
+
+  // E. Transición limpia al Menú Principal
+  currentState = STATE_MENU;
+  lastActivityTime = millis(); // Reinicia el temporizador de inactividad (Attract Mode)
+}
+
