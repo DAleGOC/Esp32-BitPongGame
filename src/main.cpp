@@ -1,9 +1,10 @@
 /**
  * @file      PinPong_Arcade.ino
- * @author    [Tu Nombre / Arcade Studio]
+ * @author    Arcade Studio
  * @brief     Secuencia de inicio y menús para consola retro ESP32.
- *            Incluye física de audio independiente (Música/SFX),
- *            inversión de controles y submenú de preparación de partida.
+ *            Incluye persistencia NVS (Flash), física de audio,
+ *            inversión de controles, submenú de preparación de partida,
+ *            control de brillo, mejores puntajes, multibola y portales.
  * @hardware  ESP32, Pantalla OLED SH1106 (I2C), Zumbador Pasivo + Transistor 2N2222.
  */
 
@@ -12,16 +13,13 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH1106.h>
 #include <Preferences.h>
+#include <Fonts/Picopixel.h>
 
-
-Preferences preferences;
-
-
+Preferences prefs;
 
 // ==========================================
 //   CONFIGURACIÓN DE HARDWARE Y PINES
 // ==========================================
-// Pantalla OLED
 #define OLED_SDA 21
 #define OLED_SCL 22
 #define OLED_RESET -1 
@@ -35,9 +33,9 @@ Preferences preferences;
 // ==========================================
 //   CONFIGURACIÓN DE CONTROLES (JOYSTICKS)
 // ==========================================
-#define J1_Y_PIN 34    // Pin analógico para Arriba/Abajo
-#define J1_BTN_PIN 25  // Pin digital para el botón (Push button)
-#define J1_X_PIN 32    // Pin analógico para Izquierda/Derecha
+#define J1_Y_PIN 34    
+#define J1_BTN_PIN 25  
+#define J1_X_PIN 32    
 #define J2_Y_PIN 35    
 #define J2_BTN_PIN 26  
 
@@ -49,10 +47,14 @@ enum GameState {
   STATE_MENU,
   STATE_MATCH_SETUP,
   STATE_PLAY,
+  STATE_POINT_SCORED,
+  STATE_PAUSE,
+  STATE_GAME_OVER,
   STATE_SETTINGS,
   STATE_CREDITS,
+  STATE_SCORES,
   STATE_SLEEP,
-  STATE_ATTRACT,
+  STATE_ATTRACT
 };
 
 GameState currentState = STATE_MENU;
@@ -61,23 +63,29 @@ GameState currentState = STATE_MENU;
 //   ESTRUCTURA Y MOTOR DE AUDIO NO BLOQUEANTE
 // ==========================================
 struct Note {
-  int frequency; // Frecuencia en Hz (0 = Pausa/Silencio)
-  int duration;  // Duración en ms
+  int frequency;
+  int duration; 
 };
 
-// Melodía Chiptune Retro en Bucle
 const Note menuMusic[] = {
   {262, 120}, {330, 120}, {392, 120}, {523, 200}, {0, 60},
   {349, 120}, {440, 120}, {523, 120}, {659, 200}, {0, 60},
   {294, 120}, {392, 120}, {494, 120}, {587, 200}, {0, 60},
   {392, 120}, {494, 120}, {587, 120}, {784, 240}, {0, 100}
 };
-
 const int menuMusicLength = sizeof(menuMusic) / sizeof(menuMusic[0]);
 
-int musicIndex = 0;             // Índice de la nota actual
-unsigned long nextNoteTime = 0; // Temporizador para la siguiente nota
-unsigned long sfxEndTime = 0;   // Bloqueo de prioridad para efectos de sonido
+const Note gameMusic[] = {
+  {523, 80}, {587, 80}, {659, 80}, {698, 80}, {784, 120}, {0, 40},
+  {659, 80}, {523, 80}, {587, 80}, {392, 160}, {0, 40},
+  {440, 80}, {494, 80}, {523, 80}, {587, 80}, {659, 120}, {0, 40},
+  {587, 80}, {494, 80}, {523, 80}, {392, 160}, {0, 40}
+};
+const int gameMusicLength = sizeof(gameMusic) / sizeof(gameMusic[0]);
+
+int musicIndex = 0;             
+unsigned long nextNoteTime = 0; 
+unsigned long sfxEndTime = 0;   
 
 // ==========================================
 //   INSTANCIAS Y VARIABLES GLOBALES
@@ -85,56 +93,141 @@ unsigned long sfxEndTime = 0;   // Bloqueo de prioridad para efectos de sonido
 Adafruit_SH1106 oledMonitor(OLED_RESET);
 
 int currentMenuOption = 0;       
-const int totalMenuOptions = 4;
+const int totalMenuOptions = 5;
 bool joystickLocked = false;     
 unsigned long lastBtnPress = 0;  
 
-// Estrellas de fondo para el menú (Parallax)
+// Estrellas de fondo
 const int MENU_STARS = 12;
 float mStarX[MENU_STARS];
 int mStarY[MENU_STARS];
 float mStarSpeed[MENU_STARS];
 bool starsInitialized = false;
 
-// Temporizador de Inactividad para Attract Mode
+// Attract Mode
 unsigned long lastActivityTime = 0; 
 const unsigned long INACTIVITY_TIMEOUT = 15000; 
 
-// CONFIGURACIÓN GLOBAL Y DE SISTEMA
-bool musicEnabled   = true;  // Música de fondo (ON/OFF)
-bool sfxEnabled     = true;  // Efectos de sonido (ON/OFF)
-bool invertControls = false; // Inversión del eje Y del Joystick (SI/NO)
+// CONFIGURACIÓN GLOBAL
+bool musicEnabled   = true;  
+bool sfxEnabled     = true;  
+bool invertControls = false; 
+int screenBrightness = 255;  
 
 // CONFIGURACIÓN DE LA PARTIDA
-int gameDifficulty = 1;   // 0: FACIL, 1: NORMAL, 2: DIFICIL
-int gameMode       = 0;    // 0: 1P vs IA, 1: 2P VS
-int scoreLimit     = 5;    // 3, 5, 10 Puntos
+int gameDifficulty = 1;   
+int gameMode       = 0;   
+int scoreLimit     = 5;   
 
-// Navegación de Submenús
 int currentSetupOption   = 0; 
 int currentSettingOption = 0; 
 
+// Puntuaciones
+int highScore = 0;
+int wins_1p_ia = 0; 
+int wins_ia = 0;    
+int wins_p1_vs = 0; 
+int wins_p2_vs = 0; 
+
 // ==========================================
-//   BITMAPS PIXEL-ART 7x7 (ICONOS MENÚ)
+//   MOTOR FÍSICO
+// ==========================================
+float paddle1Y = 24; 
+float paddle2Y = 24; 
+const int PADDLE_H = 14; 
+const int PADDLE_W = 2;  
+float paddleSpeed = 2.5; 
+
+const int BALL_SIZE = 2;
+int scoreP1 = 0;
+int scoreP2 = 0;
+
+const int HITS_FOR_NEXT_LEVEL = 10; 
+const float BALL_SPEED_LVL1 = 2.0;
+const float BALL_SPEED_LVL2 = 3.5;
+const float BALL_SPEED_LVL3 = 5.0;
+
+int consecutiveHits = 0;   
+int currentSpeedLevel = 1; 
+
+unsigned long stateTimer = 0;   
+int gameOverOption = 0;         
+unsigned long pauseButtonTimer = 0; 
+bool isPauseButtonPressed = false; 
+int pauseOption = 0; 
+GameState settingsReturnState = STATE_MENU; 
+
+// Estela y Shake
+float trailX[3], trailY[3]; 
+int shakeFrames = 0;        
+
+// POWER-UPS
+bool powerUpActive = false;
+float powerUpX = 0, powerUpY = 0;
+int powerUpType = 0;             
+unsigned long powerUpSpawnTimer = 0;
+unsigned long powerUpDurationTimer = 0;
+
+int lastPlayerToHit = 0;         
+int activePowerUpPlayer = 0;     
+int activePowerUpType = -1;      
+
+int currentPaddle1_H = PADDLE_H; 
+int currentPaddle2_H = PADDLE_H;
+bool ghostBallActive = false;
+bool invertedControlsP1 = false;
+bool invertedControlsP2 = false; 
+
+// ESTRUCTURA MULTIPELOTA
+struct Ball {
+  float x, y;
+  float dx, dy;
+  float spin;
+  bool active;
+};
+
+Ball balls[2]; 
+
+// PORTALES
+struct Portal {
+  int x, y, w, h;
+  bool active;
+  unsigned long spawnTime;
+};
+
+Portal activePortal = {0, 0, 8, 16, false, 0};
+unsigned long nextPortalTimer = 0;
+
+// ==========================================
+//   BITMAPS PIXEL-ART
 // ==========================================
 const uint8_t PROGMEM icon_play[] = {
   0b01110000, 0b10001010, 0b10001000, 0b01110000, 0b00100000, 0b00100000, 0b00100000
 };
-
 const uint8_t PROGMEM icon_settings[] = {
   0b00111000, 0b01010100, 0b10000010, 0b11010110, 0b10000010, 0b01010100, 0b00111000
 };
-
 const uint8_t PROGMEM icon_credits[] = {
   0b11111110, 0b10111010, 0b01111100, 0b00111000, 0b00010000, 0b00010000, 0b00111000
 };
-
 const uint8_t PROGMEM icon_sleep[] = {
   0b00010000, 0b01111100, 0b11010010, 0b10010010, 0b10000010, 0b01000010, 0b00111000
 };
+const uint8_t PROGMEM icon_scores[] = {
+  0b11111110, 0b01111100, 0b00111000, 0b00111000, 0b00010000, 0b00111000, 0b01111100
+};
+const uint8_t PROGMEM hud_music_on[] = {
+  0b00111000, 0b00101000, 0b00101000, 0b00101000, 0b01101100, 0b11101110, 0b01100110
+};
+const uint8_t PROGMEM hud_sfx_on[] = {
+  0b00010000, 0b00110000, 0b11110100, 0b11111010, 0b11110100, 0b00110000, 0b00010000
+};
+const uint8_t PROGMEM hud_off_mark[] = {
+  0b00000000, 0b10000010, 0b01000100, 0b00101000, 0b01000100, 0b10000010, 0b00000000
+};
 
 const uint8_t* const menuIcons[] = {
-  icon_play, icon_settings, icon_credits, icon_sleep
+  icon_play, icon_settings, icon_scores, icon_credits, icon_sleep 
 };
 
 // ==========================================
@@ -146,17 +239,33 @@ void showBouncingBallAnimation();
 void showCenterExplosion();
 void showLoadingBarAnimation();
 
+void loadSettings();
+void saveSettings();
+void checkAndSaveHighScore(int currentScore);
+void setOledBrightness(uint8_t brightness);
+
 void handleSplashScreen();
 void handleMenu();
 void handleMatchSetup();
 void handleSettings();
+void handleScores();
+void handleCredits();
 void handleSleep();
 void handleAttractMode();
+void headerHud();
 
 void animateScreenWipe();
 void playSFX(int frequency, int duration);
 void updateAudio();
 void stopAudio();
+
+void handlePlay();
+void handlePointScored();
+void handleGameOver();
+void handlePause();
+
+void resetMainBall(float dirX);
+void spawnSecondaryBall();
 
 // ==========================================
 //   HELPER DE LECTURA CON INVERSIÓN
@@ -178,8 +287,9 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(J1_BTN_PIN, INPUT_PULLUP);
 
-  // Secuencia de Arranque
-  showStudioScreen();          
+  loadSettings();
+
+  showStudioScreen();         
   showBouncingBallAnimation(); 
   showCenterExplosion();       
   showLoadingBarAnimation();   
@@ -188,37 +298,42 @@ void setup() {
 }
 
 void loop() {
-  // Motor de audio continuo en segundo plano
   updateAudio();
 
   switch (currentState) {
     case STATE_SPLASH:
       handleSplashScreen();
       break;
-
     case STATE_MENU:
       handleMenu();
       break;
-
     case STATE_MATCH_SETUP:
       handleMatchSetup();
       break;
-
     case STATE_ATTRACT:
       handleAttractMode();
       break;
-
     case STATE_PLAY:
-      // Próxima sección: Lógica del juego
+      handlePlay();
       break;
-
+    case STATE_POINT_SCORED:
+      handlePointScored();
+      break;
+    case STATE_PAUSE: 
+      handlePause();
+      break;
+    case STATE_GAME_OVER:
+      handleGameOver();
+      break;
     case STATE_SETTINGS:
       handleSettings();
       break;
-
-    case STATE_CREDITS:
+    case STATE_SCORES:
+      handleScores();
       break;
-
+    case STATE_CREDITS:
+      handleCredits();
+      break;
     case STATE_SLEEP:
       handleSleep();
       break;
@@ -239,34 +354,37 @@ void stopAudio() {
 }
 
 void updateAudio() {
-  // 1. Si hay un efecto de sonido activo, darle prioridad
-  if (millis() < sfxEndTime) {
-    return; 
-  }
+  if (millis() < sfxEndTime) return; 
+  if (!musicEnabled) return;
 
-  // 2. Si la música está apagada o no estamos en Menú/Setup, detener tono
-  if (!musicEnabled || (currentState != STATE_MENU && currentState != STATE_MATCH_SETUP)) {
+  const Note* currentTrack = NULL;
+  int trackLength = 0;
+
+  if (currentState == STATE_MENU || currentState == STATE_MATCH_SETUP) {
+    currentTrack = menuMusic;
+    trackLength = menuMusicLength;
+  } else if (currentState == STATE_PLAY) {  
+    currentTrack = gameMusic;
+    trackLength = gameMusicLength;
+  } else {
+    noTone(BUZZER_PIN);
     return;
   }
 
-  // 3. Temporizador no bloqueante para las notas de la música
   if (millis() >= nextNoteTime) {
-    int freq = menuMusic[musicIndex].frequency;
-    int dur  = menuMusic[musicIndex].duration;
+    int freq = currentTrack[musicIndex % trackLength].frequency;
+    int dur  = currentTrack[musicIndex % trackLength].duration;
 
-    if (freq > 0) {
-      tone(BUZZER_PIN, freq, dur);
-    } else {
-      noTone(BUZZER_PIN);
-    }
+    if (freq > 0) tone(BUZZER_PIN, freq, dur);
+    else noTone(BUZZER_PIN);
 
-    nextNoteTime = millis() + dur + 20; // 20ms de espacio entre notas
-    musicIndex = (musicIndex + 1) % menuMusicLength;
+    nextNoteTime = millis() + dur + 15;
+    musicIndex = (musicIndex + 1) % trackLength;
   }
 }
 
 // ==========================================
-//   IMPLEMENTACIÓN DE ANIMACIONES
+//   ANIMACIONES DE ENTRADA
 // ==========================================
 void showStudioScreen() {
   oledMonitor.clearDisplay();
@@ -315,51 +433,50 @@ void showBouncingBallAnimation() {
   oledMonitor.clearDisplay();
   oledMonitor.display();
 
-  int ballSize = 2; 
-  float ballX = 10; float ballY = 10; 
-  float ballDX = 3; float ballDY = 3; 
-  float speedMultiplier = 1.0;
+  int bSize = 2; 
+  float bX = 10, bY = 10; 
+  float bDX = 3, bDY = 3; 
+  float speedMult = 1.0;
 
-  int trailX[10]; int trailY[10];
-  for(int i = 0; i < 10; i++) { trailX[i] = -1; trailY[i] = -1; }
-  int trailIndex = 0;
+  int tX[10], tY[10];
+  for(int i = 0; i < 10; i++) { tX[i] = -1; tY[i] = -1; }
+  int tIndex = 0;
 
   unsigned long startTime = millis();
-  unsigned long phaseDuration = 4000;
 
-  while (millis() - startTime < phaseDuration) {
-    trailX[trailIndex] = (int)ballX;
-    trailY[trailIndex] = (int)ballY;
-    trailIndex = (trailIndex + 1) % 10;
+  while (millis() - startTime < 4000) {
+    tX[tIndex] = (int)bX;
+    tY[tIndex] = (int)bY;
+    tIndex = (tIndex + 1) % 10;
 
-    ballX += ballDX * speedMultiplier;
-    ballY += ballDY * speedMultiplier;
+    bX += bDX * speedMult;
+    bY += bDY * speedMult;
 
-    if (ballX <= 0 || ballX >= (SCREEN_WIDTH - ballSize)) {
-      ballDX *= -1;
-      speedMultiplier *= 1.01; 
+    if (bX <= 0 || bX >= (SCREEN_WIDTH - bSize)) {
+      bDX *= -1;
+      speedMult *= 1.01; 
       playSFX(800, 15); 
     }
-    if (ballY <= 0 || ballY >= (SCREEN_HEIGHT - ballSize)) {
-      ballDY *= -1;
-      speedMultiplier *= 1.01; 
+    if (bY <= 0 || bY >= (SCREEN_HEIGHT - bSize)) {
+      bDY *= -1;
+      speedMult *= 1.01; 
       playSFX(1000, 15); 
     }
 
-    if (millis() - startTime > 2000) { speedMultiplier += 0.08; } 
+    if (millis() - startTime > 2000) { speedMult += 0.08; } 
 
     oledMonitor.clearDisplay(); 
 
     for (int i = 0; i < 10; i++) {
-      if (trailX[i] != -1) {
-        oledMonitor.drawPixel(trailX[i], trailY[i], WHITE);
-        oledMonitor.drawPixel(trailX[i]+1, trailY[i], WHITE);
-        oledMonitor.drawPixel(trailX[i], trailY[i]+1, WHITE);
-        oledMonitor.drawPixel(trailX[i]+1, trailY[i]+1, WHITE);
+      if (tX[i] != -1) {
+        oledMonitor.drawPixel(tX[i], tY[i], WHITE);
+        oledMonitor.drawPixel(tX[i]+1, tY[i], WHITE);
+        oledMonitor.drawPixel(tX[i], tY[i]+1, WHITE);
+        oledMonitor.drawPixel(tX[i]+1, tY[i]+1, WHITE);
       }
     }
 
-    oledMonitor.fillRect((int)ballX, (int)ballY, ballSize, ballSize, WHITE);
+    oledMonitor.fillRect((int)bX, (int)bY, bSize, bSize, WHITE);
     oledMonitor.display();
     delay(10);
   }
@@ -511,7 +628,7 @@ void showLoadingBarAnimation() {
     if (showPressStart) {
       oledMonitor.setTextSize(1);
       oledMonitor.setCursor(28, 40);
-      oledMonitor.print("PRESS START");
+      oledMonitor.print("Welcome!");
     }
 
     oledMonitor.display();
@@ -542,7 +659,7 @@ void showLoadingBarAnimation() {
 }
 
 // ==========================================
-//   LÓGICA E INTERFAZ DEL MENÚ PRINCIPAL
+//   MENÚ PRINCIPAL
 // ==========================================
 void handleMenu() {
   if (!starsInitialized) {
@@ -554,7 +671,6 @@ void handleMenu() {
     starsInitialized = true;
   }
 
-  // 1. LECTURA DEL JOYSTICK
   int joyY = readJoystickY(); 
   
   if (joyY < 1000 && !joystickLocked) {
@@ -575,7 +691,6 @@ void handleMenu() {
     joystickLocked = false; 
   }
 
-  // 2. SELECCIÓN CON BOTÓN
   if (digitalRead(J1_BTN_PIN) == LOW && millis() - lastBtnPress > 300) {
     lastBtnPress = millis();
     lastActivityTime = millis(); 
@@ -591,8 +706,9 @@ void handleMenu() {
       currentSetupOption = 0;
     }
     if (currentMenuOption == 1) currentState = STATE_SETTINGS;
-    if (currentMenuOption == 2) currentState = STATE_CREDITS;
-    if (currentMenuOption == 3) currentState = STATE_SLEEP;
+    if (currentMenuOption == 2) currentState = STATE_SCORES;
+    if (currentMenuOption == 3) currentState = STATE_CREDITS;
+    if (currentMenuOption == 4) currentState = STATE_SLEEP;
     
     oledMonitor.clearDisplay();
     oledMonitor.display();
@@ -600,8 +716,8 @@ void handleMenu() {
     return; 
   }
 
-  // 3. RENDERIZADO VISUAL
   oledMonitor.clearDisplay();
+  headerHud();
 
   for (int i = 0; i < MENU_STARS; i++) {
     mStarX[i] -= mStarSpeed[i];
@@ -617,23 +733,24 @@ void handleMenu() {
   oledMonitor.setCursor(4, 2);
   oledMonitor.print("PINPONG");
   
-  oledMonitor.setCursor(100, 2);
-  oledMonitor.print("v1.0");
+  oledMonitor.setCursor(70, 2);
+  oledMonitor.print("HI:");
+  oledMonitor.print(highScore);
   oledMonitor.drawFastHLine(0, 11, 128, WHITE);
 
   int animOffset = abs((int)(millis() / 120) % 4 - 2); 
 
-  const char* options[4] = {"JUGAR", "CONFIGURACION", "CREDITOS", "SALIR"};
+  const char* options[5] = {"JUGAR", "CONFIGURACION", "PUNTAJES", "CREDITOS", "SALIR"};
   
   for (int i = 0; i < totalMenuOptions; i++) {
-    int yPos = 15 + (i * 12);
+    int yPos = 15 + (i * 10);
     
     if (i == currentMenuOption) {
       oledMonitor.setTextColor(WHITE);
       oledMonitor.setCursor(0 + animOffset, yPos);
       oledMonitor.print(">");
 
-      oledMonitor.fillRoundRect(8, yPos - 1, 114, 10, 2, WHITE);
+      oledMonitor.fillRoundRect(8, yPos - 1, 114, 9, 2, WHITE);
       
       oledMonitor.drawBitmap(12, yPos, menuIcons[i], 7, 7, BLACK);
       oledMonitor.setTextColor(BLACK); 
@@ -653,6 +770,85 @@ void handleMenu() {
     oledMonitor.display();
     return;
   }
+
+  oledMonitor.display();
+}
+
+// ==========================================
+//   SUBMENÚ: ESTADÍSTICAS
+// ==========================================
+void handleScores() {
+  oledMonitor.clearDisplay();
+  headerHud();
+
+  if (digitalRead(J1_BTN_PIN) == LOW && millis() - lastBtnPress > 300) {
+    lastBtnPress = millis();
+    playSFX(800, 40);
+    animateScreenWipe();
+    currentState = STATE_MENU;
+    return;
+  }
+
+  oledMonitor.setTextSize(1);
+  oledMonitor.setTextColor(WHITE);
+  oledMonitor.setCursor(24, 2);
+  oledMonitor.print("ESTADISTICAS");
+  oledMonitor.drawFastHLine(0, 11, 128, WHITE);
+
+  oledMonitor.setFont(&Picopixel);
+
+  oledMonitor.setCursor(2, 22);
+  oledMonitor.print("MODO [ 1P vs CPU ]");
+  
+  oledMonitor.setCursor(10, 30);
+  oledMonitor.print("JUGADOR: "); oledMonitor.print(wins_1p_ia); oledMonitor.print(" WINS");
+  
+  oledMonitor.setCursor(10, 37);
+  oledMonitor.print("CPU (IA): "); oledMonitor.print(wins_ia); oledMonitor.print(" WINS");
+
+  oledMonitor.setCursor(2, 47);
+  oledMonitor.print("MODO [ 1P vs 2P ]");
+  
+  oledMonitor.setCursor(10, 55);
+  oledMonitor.print("JUGADOR 1: "); oledMonitor.print(wins_p1_vs); oledMonitor.print(" WINS");
+  
+  oledMonitor.setCursor(10, 62);
+  oledMonitor.print("JUGADOR 2: "); oledMonitor.print(wins_p2_vs); oledMonitor.print(" WINS");
+
+  oledMonitor.setFont();
+  oledMonitor.display();
+}
+
+// ==========================================
+//   SUBMENÚ: CRÉDITOS
+// ==========================================
+void handleCredits() {
+  oledMonitor.clearDisplay();
+  headerHud();
+
+  if (digitalRead(J1_BTN_PIN) == LOW && millis() - lastBtnPress > 300) {
+    lastBtnPress = millis();
+    playSFX(800, 40);
+    animateScreenWipe();
+    currentState = STATE_MENU;
+    return;
+  }
+
+  oledMonitor.setTextSize(1);
+  oledMonitor.setTextColor(WHITE);
+  oledMonitor.setCursor(36, 2);
+  oledMonitor.print("CREDITOS");
+  oledMonitor.drawFastHLine(0, 11, 128, WHITE);
+
+  oledMonitor.setCursor(20, 20);
+  oledMonitor.print("ARCADE STUDIO");
+  oledMonitor.setCursor(20, 32);
+  oledMonitor.print("PINPONG ESP32");
+  oledMonitor.setCursor(20, 44);
+  oledMonitor.print("Diego Y Edison");
+
+  oledMonitor.setCursor(10, 56);
+  oledMonitor.print("PULSA BTN SALIR");
 
   oledMonitor.display();
 }
@@ -693,6 +889,7 @@ void handleMatchSetup() {
       case 1:
         if (moveRight) gameDifficulty = (gameDifficulty + 1) % 3;
         else gameDifficulty = (gameDifficulty == 0) ? 2 : gameDifficulty - 1;
+        saveSettings();
         break;
       case 2:
         if (scoreLimit == 3) scoreLimit = 5;
@@ -718,6 +915,7 @@ void handleMatchSetup() {
     else if (currentSetupOption == 1) {
       gameDifficulty = (gameDifficulty + 1) % 3;
       playSFX(1400, 20);
+      saveSettings();
     }
     else if (currentSetupOption == 2) {
       if (scoreLimit == 3) scoreLimit = 5;
@@ -725,16 +923,23 @@ void handleMatchSetup() {
       else scoreLimit = 3;
       playSFX(1400, 20);
     }
-    else if (currentSetupOption == 3) { // ¡EMPEZAR PARTIDA!
+    else if (currentSetupOption == 3) { 
       playSFX(1800, 80);
       delay(80);
       playSFX(2200, 150);
       animateScreenWipe();
       stopAudio(); 
+
+      // INICIALIZAR ESTADO DE LA PARTIDA
+      scoreP1 = 0; scoreP2 = 0;
+      paddle1Y = 24; paddle2Y = 24;
+      consecutiveHits = 0; currentSpeedLevel = 1;
+      resetMainBall(1.0);
+
       currentState = STATE_PLAY;
       return;
     }
-    else if (currentSetupOption == 4) { // CANCELAR
+    else if (currentSetupOption == 4) { 
       playSFX(800, 40);
       animateScreenWipe();
       currentState = STATE_MENU;
@@ -743,7 +948,7 @@ void handleMatchSetup() {
   }
 
   oledMonitor.clearDisplay();
-
+  headerHud();
   oledMonitor.setTextSize(1);
   oledMonitor.setTextColor(WHITE);
   oledMonitor.setCursor(18, 2);
@@ -804,12 +1009,13 @@ void handleMatchSetup() {
 }
 
 // ==========================================
-//   SUBMENÚ DE CONFIGURACIÓN DEL SISTEMA (ACTUALIZADO)
+//   SUBMENÚ: CONFIGURACIÓN DEL SISTEMA
 // ==========================================
 void handleSettings() {
-  const int totalSettingsOptions = 4; // 0: MUSICA, 1: SFX, 2: INVERTIR, 3: VOLVER
+  const int totalSettingsOptions = 5; 
 
   int joyY = readJoystickY();
+  int joyX = analogRead(J1_X_PIN);
 
   if (joyY < 1000 && !joystickLocked) {
     currentSettingOption--;
@@ -826,7 +1032,19 @@ void handleSettings() {
     lastActivityTime = millis();
   }
 
-  if (joyY > 1500 && joyY < 2500) {
+  if ((joyX < 1000 || joyX > 3000) && !joystickLocked && currentSettingOption == 3) {
+    if (joyX > 3000 && screenBrightness < 255) screenBrightness += 15;
+    else if (joyX < 1000 && screenBrightness > 0) screenBrightness -= 15;
+    
+    screenBrightness = constrain(screenBrightness, 0, 255);
+    setOledBrightness(screenBrightness);
+    saveSettings(); 
+    playSFX(1600, 10);
+    joystickLocked = true;
+    lastActivityTime = millis();
+  }
+
+  if (joyY > 1500 && joyY < 2500 && joyX > 1500 && joyX < 2500) {
     joystickLocked = false;
   }
 
@@ -834,28 +1052,33 @@ void handleSettings() {
     lastBtnPress = millis();
     lastActivityTime = millis();
 
-    if (currentSettingOption == 0) { // MÚSICA DE FONDO
+    if (currentSettingOption == 0) { 
       musicEnabled = !musicEnabled;
       if (!musicEnabled) stopAudio(); 
       else playSFX(1400, 30);
+      saveSettings();
     }
-    else if (currentSettingOption == 1) { // EFECTOS DE SONIDO
+    else if (currentSettingOption == 1) { 
       sfxEnabled = !sfxEnabled;
       playSFX(1400, 30);
+      saveSettings();
     }
-    else if (currentSettingOption == 2) { // INVERTIR CONTROLES
+    else if (currentSettingOption == 2) { 
       invertControls = !invertControls;
       playSFX(1400, 30);
+      saveSettings();
     }
-    else if (currentSettingOption == 3) { // VOLVER
+    else if (currentSettingOption == 4) { 
       playSFX(800, 40);
       animateScreenWipe();
-      currentState = STATE_MENU;
+      currentState = settingsReturnState;
+      settingsReturnState = STATE_MENU;
       return;
     }
   }
 
   oledMonitor.clearDisplay();
+  headerHud();
 
   oledMonitor.setTextSize(1);
   oledMonitor.setTextColor(WHITE);
@@ -865,10 +1088,10 @@ void handleSettings() {
 
   int animOffset = abs((int)(millis() / 120) % 4 - 2); 
 
-  const char* settingNames[4] = {"MUSICA", "EFECTOS SFX", "INVERTIR Y", "< VOLVER"};
+  const char* settingNames[5] = {"MUSICA", "EFECTOS SFX", "INVERTIR Y", "BRILLO", "< VOLVER"};
 
   for (int i = 0; i < totalSettingsOptions; i++) {
-    int yPos = 15 + (i * 11);
+    int yPos = 14 + (i * 10);
 
     if (i == currentSettingOption) {
       oledMonitor.setCursor(0 + animOffset, yPos);
@@ -879,18 +1102,18 @@ void handleSettings() {
     oledMonitor.print(settingNames[i]);
 
     oledMonitor.setCursor(88, yPos);
-    switch (i) {
-      case 0:
-        oledMonitor.print(musicEnabled ? "[ON]" : "[OFF]");
-        break;
-      case 1:
-        oledMonitor.print(sfxEnabled ? "[ON]" : "[OFF]");
-        break;
-      case 2:
-        oledMonitor.print(invertControls ? "[SI]" : "[NO]");
-        break;
-      case 3:
-        break;
+    if (i == 0) {
+      oledMonitor.print(musicEnabled ? "[ON]" : "[OFF]");
+    }
+    else if (i == 1) {
+      oledMonitor.print(sfxEnabled ? "[ON]" : "[OFF]");
+    }
+    else if (i == 2) {
+      oledMonitor.print(invertControls ? "[SI]" : "[NO]");
+    }
+    else if (i == 3) {
+      oledMonitor.drawRect(86, yPos, 30, 7, WHITE);
+      oledMonitor.fillRect(86, yPos, map(screenBrightness, 0, 255, 0, 30), 7, WHITE);
     }
   }
 
@@ -898,7 +1121,7 @@ void handleSettings() {
 }
 
 // ==========================================
-//   SECUENCIA DE APAGADO (STATE_SLEEP)
+//   SECUENCIA DE APAGADO
 // ==========================================
 void handleSleep() {
   oledMonitor.clearDisplay();
@@ -933,13 +1156,13 @@ void handleSleep() {
 }
 
 // ==========================================
-//   MODO DEMOSTRACIÓN (ATTRACT MODE - IA vs IA)
+//   MODO DEMOSTRACIÓN (ATTRACT MODE)
 // ==========================================
 void handleAttractMode() {
-  static float ballX = 64, ballY = 32;
-  static float ballDX = 2.5, ballDY = 1.8;
-  static float paddle1Y = 24, paddle2Y = 24;
-  const int paddleH = 14, paddleW = 2;
+  static float demoX = 64, demoY = 32;
+  static float demoDX = 2.5, demoDY = 1.8;
+  static float demoP1Y = 24, demoP2Y = 24;
+  const int pH = 14, pW = 2;
   static unsigned long blinkTimer = 0;
   static bool showText = true;
 
@@ -956,43 +1179,42 @@ void handleAttractMode() {
     return;
   }
 
-  ballX += ballDX;
-  ballY += ballDY;
+  demoX += demoDX;
+  demoY += demoDY;
 
-  if (ballX < 70) {
-    if (paddle1Y + (paddleH / 2) < ballY) paddle1Y += 1.5;
-    if (paddle1Y + (paddleH / 2) > ballY) paddle1Y -= 1.5;
+  if (demoX < 70) {
+    if (demoP1Y + (pH / 2) < demoY) demoP1Y += 1.5;
+    if (demoP1Y + (pH / 2) > demoY) demoP1Y -= 1.5;
   }
 
-  if (ballX > 58) {
-    if (paddle2Y + (paddleH / 2) < ballY) paddle2Y += 1.5;
-    if (paddle2Y + (paddleH / 2) > ballY) paddle2Y -= 1.5;
+  if (demoX > 58) {
+    if (demoP2Y + (pH / 2) < demoY) demoP2Y += 1.5;
+    if (demoP2Y + (pH / 2) > demoY) demoP2Y -= 1.5;
   }
 
-  paddle1Y = constrain(paddle1Y, 0, SCREEN_HEIGHT - paddleH);
-  paddle2Y = constrain(paddle2Y, 0, SCREEN_HEIGHT - paddleH);
+  demoP1Y = constrain(demoP1Y, 0, SCREEN_HEIGHT - pH);
+  demoP2Y = constrain(demoP2Y, 0, SCREEN_HEIGHT - pH);
 
-  if (ballY <= 0 || ballY >= SCREEN_HEIGHT - 2) {
-    ballDY *= -1;
+  if (demoY <= 0 || demoY >= SCREEN_HEIGHT - 2) {
+    demoDY *= -1;
     playSFX(600, 10);
   }
 
-  if (ballX <= (4 + paddleW) && ballY >= paddle1Y && ballY <= paddle1Y + paddleH) {
-    ballDX *= -1;
-    ballX = 4 + paddleW + 1;
+  if (demoX <= (4 + pW) && demoY >= demoP1Y && demoY <= demoP1Y + pH) {
+    demoDX *= -1;
+    demoX = 4 + pW + 1;
     playSFX(900, 15);
   }
 
-  if (ballX >= (124 - paddleW) && ballY >= paddle2Y && ballY <= paddle2Y + paddleH) {
-    ballDX *= -1;
-    ballX = 124 - paddleW - 1;
+  if (demoX >= (124 - pW) && demoY >= demoP2Y && demoY <= demoP2Y + pH) {
+    demoDX *= -1;
+    demoX = 124 - pW - 1;
     playSFX(900, 15);
   }
 
-  if (ballX < 0 || ballX > SCREEN_WIDTH) {
-    ballX = 64;
-    ballY = 32;
-    ballDX = (random(0, 2) == 0 ? 2.5 : -2.5);
+  if (demoX < 0 || demoX > SCREEN_WIDTH) {
+    demoX = 64; demoY = 32;
+    demoDX = (random(0, 2) == 0 ? 2.5 : -2.5);
   }
 
   oledMonitor.clearDisplay();
@@ -1001,9 +1223,9 @@ void handleAttractMode() {
     oledMonitor.drawFastVLine(64, y, 3, WHITE);
   }
 
-  oledMonitor.fillRect(4, (int)paddle1Y, paddleW, paddleH, WHITE);
-  oledMonitor.fillRect(124 - paddleW, (int)paddle2Y, paddleW, paddleH, WHITE);
-  oledMonitor.fillRect((int)ballX, (int)ballY, 2, 2, WHITE);
+  oledMonitor.fillRect(4, (int)demoP1Y, pW, pH, WHITE);
+  oledMonitor.fillRect(124 - pW, (int)demoP2Y, pW, pH, WHITE);
+  oledMonitor.fillRect((int)demoX, (int)demoY, 2, 2, WHITE);
 
   if (millis() - blinkTimer > 500) {
     showText = !showText;
@@ -1024,7 +1246,7 @@ void handleAttractMode() {
 }
 
 // ==========================================
-//   PANTALLA DE CARGA / SPLASH SCREEN
+//   SPLASH SCREEN
 // ==========================================
 void handleSplashScreen() {
   for (int y = -16; y <= 6; y += 2) {
@@ -1065,9 +1287,6 @@ void handleSplashScreen() {
   lastActivityTime = millis(); 
 }
 
-// ==========================================
-//   TRANSICIÓN SUAVE ENTRE PANTALLAS (WIPE)
-// ==========================================
 void animateScreenWipe() {
   for (int x = 0; x <= 128; x += 10) {
     oledMonitor.fillRect(0, 0, x, 64, WHITE);
@@ -1078,4 +1297,587 @@ void animateScreenWipe() {
   delay(40); 
   oledMonitor.clearDisplay();
   oledMonitor.display();
+}
+
+// ==========================================
+//   NVS FLASH & HARDWARE
+// ==========================================
+void loadSettings() {
+  prefs.begin("arcade", true);
+
+  musicEnabled     = prefs.getBool("music", true);
+  sfxEnabled       = prefs.getBool("sfx", true);
+  invertControls   = prefs.getBool("invert", false);
+  gameDifficulty   = prefs.getInt("diff", 1);
+  highScore        = prefs.getInt("hscore", 0);
+  screenBrightness = prefs.getInt("bright", 255);
+
+  wins_1p_ia = prefs.getInt("w_1pia", 0);
+  wins_ia    = prefs.getInt("w_ia", 0);
+  wins_p1_vs = prefs.getInt("w_p1vs", 0);
+  wins_p2_vs = prefs.getInt("w_p2vs", 0);
+  
+  prefs.end();
+  setOledBrightness(screenBrightness);
+}
+
+void saveSettings() {
+  prefs.begin("arcade", false);
+
+  prefs.putBool("music", musicEnabled);
+  prefs.putBool("sfx", sfxEnabled);
+  prefs.putBool("invert", invertControls);
+  prefs.putInt("diff", gameDifficulty);
+  prefs.putInt("bright", screenBrightness);
+
+  prefs.putInt("w_1pia", wins_1p_ia);
+  prefs.putInt("w_ia", wins_ia);
+  prefs.putInt("w_p1vs", wins_p1_vs);
+  prefs.putInt("w_p2vs", wins_p2_vs);
+
+  prefs.end();
+}
+
+void checkAndSaveHighScore(int currentScore) {
+  if (currentScore > highScore) {
+    highScore = currentScore;
+    prefs.begin("arcade", false);
+    prefs.putInt("hscore", highScore);
+    prefs.end();
+  }
+}
+
+void setOledBrightness(uint8_t brightness) {
+  Wire.beginTransmission(OLED_ADDRESS);
+  Wire.write(0x00);         
+  Wire.write(0x81);         
+  Wire.write(brightness);   
+  Wire.endTransmission();
+}
+
+void headerHud() {
+  oledMonitor.drawBitmap(102, 2, hud_music_on, 7, 7, WHITE);
+  if (!musicEnabled) { 
+    oledMonitor.drawBitmap(102, 2, hud_off_mark, 7, 7, BLACK); 
+    oledMonitor.drawLine(102, 2, 108, 8, WHITE); 
+  }
+
+  oledMonitor.drawBitmap(114, 2, hud_sfx_on, 7, 7, WHITE);
+  if (!sfxEnabled) {
+    oledMonitor.drawBitmap(114, 2, hud_off_mark, 7, 7, BLACK);
+    oledMonitor.drawLine(114, 2, 120, 8, WHITE); 
+  }
+}
+
+// ==========================================
+//   MOTOR PRINCIPAL DEL JUEGO (STATE_PLAY)
+// ==========================================
+void handlePlay() {
+  oledMonitor.clearDisplay();
+
+  // --- BOTÓN DE PAUSA ---
+  if (digitalRead(J1_BTN_PIN) == LOW) {
+    if (!isPauseButtonPressed) {
+      isPauseButtonPressed = true;
+      pauseButtonTimer = millis(); 
+    } 
+    else if (millis() - pauseButtonTimer > 1600) {
+      isPauseButtonPressed = true; 
+      pauseOption = 0;             
+      currentState = STATE_PAUSE;  
+      stopAudio();                 
+      return;                      
+    }
+  } else {
+    isPauseButtonPressed = false; 
+  }
+
+  // --- TEMBLOR DE PANTALLA ---
+  int shakeOffset = 0;
+  if (shakeFrames > 0) {
+    shakeOffset = random(-2, 3);
+    shakeFrames--; 
+  }
+
+  // 1. DIBUJAR LA CANCHA
+  for (int y = 0; y < SCREEN_HEIGHT; y += 6) {
+    oledMonitor.drawFastVLine(64, y + shakeOffset, 3, WHITE);
+  }
+
+  // 2. MARCADORES E INDICADOR DE PODERES
+  oledMonitor.setTextSize(1);
+  oledMonitor.setTextColor(WHITE);
+  oledMonitor.setCursor(20, 2 + shakeOffset); oledMonitor.print(scoreP1);
+  oledMonitor.setCursor(102, 2 + shakeOffset); oledMonitor.print(scoreP2);
+  
+  if (activePowerUpType != -1) {
+    oledMonitor.setCursor(40, 2 + shakeOffset);
+    if (activePowerUpType == 0) oledMonitor.print("GIGANTE");
+    else if (activePowerUpType == 1) oledMonitor.print("ENCOGER");
+    else if (activePowerUpType == 2) oledMonitor.print("FUEGO");
+    else if (activePowerUpType == 3) oledMonitor.print("FANTASMA");
+    else if (activePowerUpType == 4) oledMonitor.print("INVERTIR");
+  } else {
+    oledMonitor.setCursor(50, 2 + shakeOffset);
+    oledMonitor.print("LVL "); oledMonitor.print(currentSpeedLevel);  
+  }
+
+  // 3. MOVIMIENTO DE JUGADORES (J1 Y J2 / CPU)
+  int joy1Y = readJoystickY(); 
+  if (!invertedControlsP1) {
+    if (joy1Y < 1000) paddle1Y -= paddleSpeed;
+    if (joy1Y > 3000) paddle1Y += paddleSpeed;
+  } else { 
+    if (joy1Y < 1000) paddle1Y += paddleSpeed; 
+    if (joy1Y > 3000) paddle1Y -= paddleSpeed;
+  }
+
+  int joy2Y = analogRead(J2_Y_PIN);
+  if (gameMode == 1) {
+    if (invertControls) joy2Y = 4095 - joy2Y; 
+    if (!invertedControlsP2) {
+      if (joy2Y < 1000) paddle2Y -= paddleSpeed;
+      if (joy2Y > 3000) paddle2Y += paddleSpeed;
+    } else { 
+      if (joy2Y < 1000) paddle2Y += paddleSpeed;
+      if (joy2Y > 3000) paddle2Y -= paddleSpeed;
+    }
+  } else {
+    // IA CPU: Rastrea la pelota relevante
+    float targetY = 32;
+    if (balls[0].active && balls[1].active) {
+      targetY = (balls[0].x > balls[1].x) ? balls[0].y : balls[1].y;
+    } else if (balls[0].active) {
+      targetY = balls[0].y;
+    } else if (balls[1].active) {
+      targetY = balls[1].y;
+    }
+
+    float aiSpeedMultiplier = (gameDifficulty == 0) ? 0.4 : ((gameDifficulty == 1) ? 0.7 : 1.0);
+    if (!invertedControlsP2) {
+      if (paddle2Y + (currentPaddle2_H / 2) < targetY) paddle2Y += (paddleSpeed * aiSpeedMultiplier);
+      if (paddle2Y + (currentPaddle2_H / 2) > targetY) paddle2Y -= (paddleSpeed * aiSpeedMultiplier);
+    } else {
+      if (paddle2Y + (currentPaddle2_H / 2) < targetY) paddle2Y -= (paddleSpeed * aiSpeedMultiplier);
+      if (paddle2Y + (currentPaddle2_H / 2) > targetY) paddle2Y += (paddleSpeed * aiSpeedMultiplier);
+    }
+  }
+
+  paddle1Y = constrain(paddle1Y, 0, SCREEN_HEIGHT - currentPaddle1_H);
+  paddle2Y = constrain(paddle2Y, 0, SCREEN_HEIGHT - currentPaddle2_H);
+
+  // 4. CAJAS MISTERIOSAS
+  if (!powerUpActive && activePowerUpType == -1 && millis() - powerUpSpawnTimer > random(10000, 15000)) {
+    powerUpActive = true;
+    powerUpX = random(30, 90); 
+    powerUpY = random(10, SCREEN_HEIGHT - 10);
+    powerUpType = random(0, 5);
+  }
+
+  if (powerUpActive) {
+    if ((millis() / 150) % 2 == 0) {
+      oledMonitor.drawRect((int)powerUpX, (int)powerUpY + shakeOffset, 6, 6, WHITE);
+      oledMonitor.drawPixel((int)powerUpX + 2, (int)powerUpY + 2 + shakeOffset, WHITE);
+    }
+    
+    for (int b = 0; b < 2; b++) {
+      if (!balls[b].active) continue;
+      if (balls[b].x + BALL_SIZE >= powerUpX && balls[b].x <= powerUpX + 6 && 
+          balls[b].y + BALL_SIZE >= powerUpY && balls[b].y <= powerUpY + 6) {
+          
+          powerUpActive = false;
+          playSFX(1800, 150); 
+          
+          if (lastPlayerToHit > 0) {
+            activePowerUpPlayer = lastPlayerToHit;
+            activePowerUpType = powerUpType;
+            powerUpDurationTimer = millis();
+
+            if (powerUpType == 0) { 
+              if (activePowerUpPlayer == 1) currentPaddle1_H = PADDLE_H * 2; else currentPaddle2_H = PADDLE_H * 2;
+            } else if (powerUpType == 1) { 
+              if (activePowerUpPlayer == 1) currentPaddle2_H = PADDLE_H / 2; else currentPaddle1_H = PADDLE_H / 2;
+            } else if (powerUpType == 2) { 
+              shakeFrames = 10;
+              balls[b].dx = (activePowerUpPlayer == 1) ? 6.0 : -6.0;
+            } else if (powerUpType == 3) { 
+              ghostBallActive = true;
+            } else if (powerUpType == 4) { 
+              if (activePowerUpPlayer == 1) invertedControlsP2 = true; else invertedControlsP1 = true;
+            }
+          }
+          break;
+      }
+    }
+  }
+
+  if (activePowerUpType != -1 && millis() - powerUpDurationTimer > 5000) {
+      currentPaddle1_H = PADDLE_H; currentPaddle2_H = PADDLE_H;
+      ghostBallActive = false;
+      invertedControlsP1 = false; invertedControlsP2 = false;
+      activePowerUpType = -1;
+      powerUpSpawnTimer = millis(); 
+      playSFX(400, 100); 
+  }
+
+  // 5. ZONA PORTAL
+  if (!activePortal.active && millis() - nextPortalTimer > random(8000, 15000)) {
+    activePortal.active = true;
+    activePortal.x = random(52, 72); 
+    activePortal.y = random(8, SCREEN_HEIGHT - 20);
+    activePortal.w = 6;
+    activePortal.h = 16;
+    activePortal.spawnTime = millis();
+  }
+
+  if (activePortal.active) {
+    if (millis() - activePortal.spawnTime > 6000) {
+      activePortal.active = false;
+      nextPortalTimer = millis();
+    } else {
+      if ((millis() / 100) % 2 == 0) {
+        oledMonitor.drawRect(activePortal.x, activePortal.y + shakeOffset, activePortal.w, activePortal.h, WHITE);
+      }
+    }
+  }
+
+  // 6. GENERAR MULTIPELOTA
+  if (!balls[1].active && consecutiveHits > 6 && random(0, 100) < 5) {
+    spawnSecondaryBall();
+  }
+
+  // 7. DIBUJAR ESTELA (DE LA PELOTA PRINCIPAL)
+  if (balls[0].active) {
+    trailX[2] = trailX[1]; trailY[2] = trailY[1];
+    trailX[1] = trailX[0]; trailY[1] = trailY[0];
+    trailX[0] = balls[0].x; trailY[0] = balls[0].y;
+
+    if ((currentSpeedLevel > 1 || abs(balls[0].spin) > 0.05) && (!ghostBallActive || (millis() / 200) % 2 == 0)) {
+      oledMonitor.drawPixel((int)trailX[0], (int)trailY[0] + shakeOffset, WHITE); 
+      oledMonitor.drawPixel((int)trailX[1], (int)trailY[1] + shakeOffset, WHITE); 
+      oledMonitor.drawPixel((int)trailX[2], (int)trailY[2] + shakeOffset, WHITE); 
+    }
+  }
+
+  // 8. DIBUJAR PALETAS
+  oledMonitor.fillRect(4, (int)paddle1Y + shakeOffset, PADDLE_W, currentPaddle1_H, WHITE);
+  oledMonitor.fillRect(124 - PADDLE_W, (int)paddle2Y + shakeOffset, PADDLE_W, currentPaddle2_H, WHITE);
+
+  // 9. BUCLE DE FÍSICA PARA CADA PELOTA
+  int activeBallsCount = 0;
+  for (int i = 0; i < 2; i++) {
+    if (balls[i].active) activeBallsCount++;
+  }
+
+  for (int i = 0; i < 2; i++) {
+    if (!balls[i].active) continue;
+
+    // Movimiento y curva
+    balls[i].dy += balls[i].spin;
+    balls[i].dy = constrain(balls[i].dy, -4.0, 4.0);
+    balls[i].x += balls[i].dx;
+    balls[i].y += balls[i].dy;
+
+    // Colisión con Portal
+    if (activePortal.active && 
+        balls[i].x + BALL_SIZE >= activePortal.x && balls[i].x <= activePortal.x + activePortal.w &&
+        balls[i].y + BALL_SIZE >= activePortal.y && balls[i].y <= activePortal.y + activePortal.h) {
+      
+      balls[i].dx *= 1.4; 
+      balls[i].y = random(4, SCREEN_HEIGHT - 12); 
+      activePortal.active = false;
+      nextPortalTimer = millis();
+      shakeFrames = 6;
+      playSFX(2100, 100);
+    }
+
+    // Rebote techo y piso
+    if (balls[i].y <= 0) {
+      balls[i].y = 1; balls[i].dy *= -1; balls[i].spin *= -0.5; playSFX(600, 15);
+    } else if (balls[i].y >= SCREEN_HEIGHT - BALL_SIZE) {
+      balls[i].y = SCREEN_HEIGHT - BALL_SIZE - 1; balls[i].dy *= -1; balls[i].spin *= -0.5; playSFX(600, 15);
+    }
+
+    // Colisión Paleta P1
+    if (balls[i].x <= (4 + PADDLE_W) && balls[i].y + BALL_SIZE >= paddle1Y && balls[i].y <= paddle1Y + currentPaddle1_H) {
+      float hitPoint = (balls[i].y + (BALL_SIZE / 2.0)) - (paddle1Y + (currentPaddle1_H / 2.0));
+      lastPlayerToHit = 1;
+      
+      if (joy1Y < 1000) balls[i].spin = -0.12;
+      else if (joy1Y > 3000) balls[i].spin = 0.12;
+      else balls[i].spin = 0.0;
+
+      consecutiveHits++;
+      if (consecutiveHits % HITS_FOR_NEXT_LEVEL == 0 && currentSpeedLevel < 3) {
+        currentSpeedLevel++; playSFX(1500, 100);
+      }
+      if (currentSpeedLevel == 3) shakeFrames = 5;
+
+      float speed = (currentSpeedLevel == 1) ? BALL_SPEED_LVL1 : ((currentSpeedLevel == 2) ? BALL_SPEED_LVL2 : BALL_SPEED_LVL3);
+      if (abs(hitPoint) > (currentPaddle1_H / 3.0)) { speed *= 1.25; shakeFrames = 4; playSFX(1800, 30); }
+
+      balls[i].dx = speed;
+      balls[i].dy = hitPoint * 0.25;
+      if (balls[i].dy > -0.1 && balls[i].dy < 0.1) balls[i].dy = (random(0, 2) == 0) ? 0.5 : -0.5;
+      balls[i].x = 4 + PADDLE_W;
+      playSFX(900 + (consecutiveHits * 20), 20);
+    }
+
+    // Colisión Paleta P2
+    if (balls[i].x + BALL_SIZE >= (124 - PADDLE_W) && balls[i].y + BALL_SIZE >= paddle2Y && balls[i].y <= paddle2Y + currentPaddle2_H) {
+      float hitPoint = (balls[i].y + (BALL_SIZE / 2.0)) - (paddle2Y + (currentPaddle2_H / 2.0));
+      lastPlayerToHit = 2;
+      
+      if (gameMode == 1) {
+        if (joy2Y < 1000) balls[i].spin = -0.12;
+        else if (joy2Y > 3000) balls[i].spin = 0.12;
+        else balls[i].spin = 0.0;
+      } else {
+        balls[i].spin = (gameDifficulty == 2) ? (random(-10, 11) / 100.0) : 0.0;
+      }
+
+      consecutiveHits++;
+      if (consecutiveHits % HITS_FOR_NEXT_LEVEL == 0 && currentSpeedLevel < 3) {
+        currentSpeedLevel++; playSFX(1500, 100);
+      }
+      if (currentSpeedLevel == 3) shakeFrames = 5;
+
+      float speed = (currentSpeedLevel == 1) ? BALL_SPEED_LVL1 : ((currentSpeedLevel == 2) ? BALL_SPEED_LVL2 : BALL_SPEED_LVL3);
+      if (abs(hitPoint) > (currentPaddle2_H / 3.0)) { speed *= 1.25; shakeFrames = 4; playSFX(1800, 30); }
+
+      balls[i].dx = -speed;
+      balls[i].dy = hitPoint * 0.25;
+      if (balls[i].dy > -0.1 && balls[i].dy < 0.1) balls[i].dy = (random(0, 2) == 0) ? 0.5 : -0.5;
+      balls[i].x = 124 - PADDLE_W - BALL_SIZE;
+      playSFX(900 + (consecutiveHits * 20), 20);
+    }
+
+    // Anotación de punto
+    if (balls[i].x < 0 || balls[i].x > SCREEN_WIDTH) {
+      bool isP1Point = (balls[i].x > SCREEN_WIDTH);
+      balls[i].active = false; 
+
+      if (activeBallsCount > 1) {
+        if (isP1Point) scoreP1++; else scoreP2++;
+        playSFX(1000, 100);
+        activeBallsCount--;
+        continue; 
+      }
+
+      // Es la última pelota en pantalla
+      if (isP1Point) { scoreP1++; playSFX(1200, 200); }
+      else { scoreP2++; playSFX(300, 200); }
+
+      resetMainBall(isP1Point ? BALL_SPEED_LVL1 : -BALL_SPEED_LVL1);
+      consecutiveHits = 0; currentSpeedLevel = 1;
+      activePortal.active = false;
+      nextPortalTimer = millis();
+
+      powerUpActive = false; activePowerUpType = -1; lastPlayerToHit = 0;
+      currentPaddle1_H = PADDLE_H; currentPaddle2_H = PADDLE_H;
+      ghostBallActive = false; invertedControlsP1 = false; invertedControlsP2 = false;
+      powerUpSpawnTimer = millis();
+
+      stateTimer = millis();
+      currentState = STATE_POINT_SCORED;
+      return;
+    }
+
+    // Dibujar pelota
+    if (!ghostBallActive || (ghostBallActive && (millis() / 200) % 2 == 0)) {
+      oledMonitor.fillRect((int)balls[i].x, (int)balls[i].y + shakeOffset, BALL_SIZE, BALL_SIZE, WHITE);
+    }
+  }
+
+  // 10. COMPROBAR VICTORIA
+  if (scoreP1 >= scoreLimit || scoreP2 >= scoreLimit) {
+    int winner = (scoreP1 >= scoreLimit) ? 1 : 2;
+    if (gameMode == 0) { if (winner == 1) wins_1p_ia++; else wins_ia++; } 
+    else { if (winner == 1) wins_p1_vs++; else wins_p2_vs++; }
+    saveSettings(); 
+    stopAudio();    
+    
+    if (gameMode == 0 && winner == 2) playSFX(300, 800); 
+    else { playSFX(523, 150); playSFX(784, 150); playSFX(1046, 400); } 
+
+    gameOverOption = 0;             
+    currentState = STATE_GAME_OVER; 
+    return;
+  }
+
+  oledMonitor.display();
+}
+
+// ==========================================
+// ESTADO: PUNTO ANOTADO
+// ==========================================
+void handlePointScored() {
+  oledMonitor.clearDisplay();
+  
+  for (int y = 0; y < SCREEN_HEIGHT; y += 6) oledMonitor.drawFastVLine(64, y, 3, WHITE);
+  oledMonitor.setTextSize(1); oledMonitor.setTextColor(WHITE);
+  oledMonitor.setCursor(20, 2); oledMonitor.print(scoreP1);
+  oledMonitor.setCursor(102, 2); oledMonitor.print(scoreP2);
+  oledMonitor.fillRect(4, (int)paddle1Y, PADDLE_W, currentPaddle1_H, WHITE);
+  oledMonitor.fillRect(124 - PADDLE_W, (int)paddle2Y, PADDLE_W, currentPaddle2_H, WHITE);
+
+  if ((millis() / 250) % 2 == 0 && balls[0].active) {
+     oledMonitor.fillRect((int)balls[0].x, (int)balls[0].y, BALL_SIZE, BALL_SIZE, WHITE);
+  }
+  
+  oledMonitor.display();
+
+  if (millis() - stateTimer > 1500) {
+    currentState = STATE_PLAY;
+  }
+}
+
+// ==========================================
+// ESTADO: MENÚ DE FIN DE PARTIDA
+// ==========================================
+void handleGameOver() {
+  oledMonitor.clearDisplay();
+  int winner = (scoreP1 >= scoreLimit) ? 1 : 2;
+  
+  oledMonitor.setTextSize(2);
+  oledMonitor.setTextColor(WHITE);
+  oledMonitor.setCursor(10, 8);
+  if (gameMode == 0 && winner == 2) oledMonitor.print("CPU GANA");
+  else { oledMonitor.print("J"); oledMonitor.print(winner); oledMonitor.print(" GANA"); }
+
+  int joy1Y = readJoystickY();
+  if (joy1Y < 1000) gameOverOption = 0; 
+  if (joy1Y > 3000) gameOverOption = 1; 
+
+  oledMonitor.setTextSize(1);
+  if (gameOverOption == 0) {
+    oledMonitor.fillRect(15, 33, 98, 13, WHITE);
+    oledMonitor.setTextColor(BLACK);
+  } else { oledMonitor.setTextColor(WHITE); }
+  oledMonitor.setCursor(22, 36);
+  oledMonitor.print("NUEVA PARTIDA");
+
+  if (gameOverOption == 1) {
+    oledMonitor.fillRect(15, 48, 98, 13, WHITE);
+    oledMonitor.setTextColor(BLACK);
+  } else { oledMonitor.setTextColor(WHITE); }
+  oledMonitor.setCursor(22, 51);
+  oledMonitor.print("MENU PRINCIPAL");
+
+  oledMonitor.display();
+
+  if (digitalRead(J1_BTN_PIN) == LOW) {
+    delay(200); 
+    
+    scoreP1 = 0; scoreP2 = 0;
+    paddle1Y = 24; paddle2Y = 24;
+    consecutiveHits = 0; currentSpeedLevel = 1;
+    resetMainBall(1.0);
+
+    if (gameOverOption == 0) {
+      currentState = STATE_PLAY; 
+    } else {
+      animateScreenWipe();
+      currentState = STATE_MENU; 
+    }
+  }
+}
+
+// ==========================================
+// ESTADO: MENÚ DE PAUSA
+// ==========================================
+void handlePause() {
+  oledMonitor.clearDisplay();
+  
+  oledMonitor.setTextSize(1);
+  oledMonitor.setTextColor(WHITE);
+  oledMonitor.setCursor(50, 5);
+  oledMonitor.print("PAUSA");
+
+  int joy1Y = readJoystickY();
+  if (joy1Y < 1000) {
+    pauseOption--;
+    if (pauseOption < 0) pauseOption = 2; 
+    playSFX(800, 15); 
+    delay(150); 
+  }
+  if (joy1Y > 3000) {
+    pauseOption++;
+    if (pauseOption > 2) pauseOption = 0;  
+    playSFX(800, 15);  
+    delay(150);
+  }
+
+  if (pauseOption == 0) {
+    oledMonitor.fillRect(15, 18, 98, 11, WHITE);
+    oledMonitor.setTextColor(BLACK);
+  } else { oledMonitor.setTextColor(WHITE); }
+  oledMonitor.setCursor(35, 20);
+  oledMonitor.print("CONTINUAR");
+
+  if (pauseOption == 1) {
+    oledMonitor.fillRect(15, 33, 98, 11, WHITE);
+    oledMonitor.setTextColor(BLACK);
+  } else { oledMonitor.setTextColor(WHITE); }
+  oledMonitor.setCursor(25, 35);
+  oledMonitor.print("CONFIGURACION");
+
+  if (pauseOption == 2) {
+    oledMonitor.fillRect(15, 48, 98, 11, WHITE);
+    oledMonitor.setTextColor(BLACK);
+  } else { oledMonitor.setTextColor(WHITE); }
+  oledMonitor.setCursor(48, 50);
+  oledMonitor.print("SALIR");
+
+  oledMonitor.display();
+
+  if (digitalRead(J1_BTN_PIN) == HIGH) {
+     isPauseButtonPressed = false; 
+  }
+
+  if (digitalRead(J1_BTN_PIN) == LOW && !isPauseButtonPressed) {
+    delay(200); 
+    playSFX(800, 15);
+    
+    if (pauseOption == 0) {
+      currentState = STATE_PLAY; 
+    } else if (pauseOption == 1) {
+      settingsReturnState = STATE_PAUSE; 
+      currentState = STATE_SETTINGS; 
+    } else {
+      scoreP1 = 0; scoreP2 = 0;
+      consecutiveHits = 0; currentSpeedLevel = 1;
+      resetMainBall(1.0);
+
+      animateScreenWipe();
+      settingsReturnState = STATE_MENU; 
+      currentState = STATE_MENU; 
+    }
+  }
+}
+
+// ==========================================
+// FUNCIONES AUXILIARES MULTIPELOTA
+// ==========================================
+void resetMainBall(float dirX) {
+  balls[0].x = 64;
+  balls[0].y = 32;
+  balls[0].spin = 0.0;
+  balls[0].dx = (dirX >= 0 ? 1.0 : -1.0) * BALL_SPEED_LVL1;
+  balls[0].dy = (random(0, 2) == 0 ? 1.5 : -1.5);
+  balls[0].active = true;
+
+  balls[1].active = false;
+}
+
+void spawnSecondaryBall() {
+  if (!balls[1].active && balls[0].active) {
+    balls[1].x = balls[0].x;
+    balls[1].y = balls[0].y;
+    balls[1].dx = -balls[0].dx; 
+    balls[1].dy = -balls[0].dy * 0.9;
+    balls[1].spin = 0.0;
+    balls[1].active = true;
+    playSFX(1500, 150);
+  }
 }
