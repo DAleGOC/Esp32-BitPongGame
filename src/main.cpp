@@ -1,3 +1,4 @@
+/* PinPong Arcade - V3 */
 /**
  * @file      PinPong_Arcade.ino
  * @author    Arcade Studio
@@ -136,7 +137,33 @@ float paddle1Y = 24;
 float paddle2Y = 24; 
 const int PADDLE_H = 14; 
 const int PADDLE_W = 2;  
-float paddleSpeed = 2.5; 
+float paddleSpeed = 2.5;
+
+// V3: velocidad de las paletas para que el rebote tenga "peso".
+float paddle1Velocity = 0.0;
+float paddle2Velocity = 0.0;
+float lastPaddle1Y = 24.0;
+float lastPaddle2Y = 24.0;
+
+// Física y controles mejorados
+const float FRAME_REFERENCE_MS = 16.6667; // 60 FPS de referencia
+const float BALL_MAX_SPEED = 5.5;
+// V3: pequeña aceleración progresiva durante rallies largos.
+const float RALLY_SPEED_BONUS = 0.018;
+const int RALLY_BONUS_CAP = 20;
+const float PADDLE_INFLUENCE = 0.38;
+const int JOY_CENTER = 2048;
+const int JOY_DEADZONE = 220;
+const int JOY_MIN = 0;
+const int JOY_MAX = 4095;
+const float MIN_VERTICAL_SPEED = 0.45;
+const float MAX_VERTICAL_SPEED = 3.2;
+const int COURT_TOP_Y = 13;
+const int COURT_BOTTOM_Y = SCREEN_HEIGHT - 1;
+
+unsigned long lastPhysicsUpdate = 0;
+unsigned long powerUpSpawnDelay = 12000;
+unsigned long portalSpawnDelay = 10000;
 
 const int BALL_SIZE = 2;
 int scoreP1 = 0;
@@ -160,6 +187,23 @@ GameState settingsReturnState = STATE_MENU;
 // Estela y Shake
 float trailX[3], trailY[3]; 
 int shakeFrames = 0;        
+int wallFlashFrames = 0;
+int wallFlashX = 0;
+int wallFlashY = 0;
+
+// V3.1: sistema de impacto visual para que cada rebote sea claramente perceptible.
+struct ImpactFX {
+  bool active;
+  int x, y;
+  int direction;       // -1 = izquierda/arriba, +1 = derecha/abajo
+  uint8_t type;        // 0 = pared, 1 = P1, 2 = P2, 3 = portal
+  uint8_t frame;
+};
+
+const int MAX_IMPACT_FX = 6;
+ImpactFX impactFX[MAX_IMPACT_FX];
+int ballFlashFrames[2] = {0, 0};
+
 
 // POWER-UPS
 bool powerUpActive = false;
@@ -183,6 +227,7 @@ struct Ball {
   float x, y;
   float dx, dy;
   float spin;
+  int lastHitBy; // 0 = nadie, 1 = P1, 2 = P2
   bool active;
 };
 
@@ -266,6 +311,14 @@ void handlePause();
 
 void resetMainBall(float dirX);
 void spawnSecondaryBall();
+void scheduleArcadeTimers();
+void updatePlayerPaddle(int rawY, float &paddleY, int paddleHeight, bool inverted, float physicsScale);
+void updateCpuPaddle(float physicsScale);
+float calculateBounceY(float ballY, float paddleY, int paddleHeight, float paddleVelocity);
+float getCurrentBallSpeed();
+void triggerImpactFX(int x, int y, int direction, uint8_t type, uint8_t strength = 1);
+void updateAndDrawImpactFX(int shakeOffset);
+
 
 // ==========================================
 //   HELPER DE LECTURA CON INVERSIÓN
@@ -286,6 +339,7 @@ void setup() {
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(J1_BTN_PIN, INPUT_PULLUP);
+  pinMode(J2_BTN_PIN, INPUT_PULLUP);
 
   loadSettings();
 
@@ -295,6 +349,7 @@ void setup() {
   showLoadingBarAnimation();   
   
   lastActivityTime = millis();
+  scheduleArcadeTimers();
 }
 
 void loop() {
@@ -933,8 +988,12 @@ void handleMatchSetup() {
       // INICIALIZAR ESTADO DE LA PARTIDA
       scoreP1 = 0; scoreP2 = 0;
       paddle1Y = 24; paddle2Y = 24;
+      lastPaddle1Y = paddle1Y; lastPaddle2Y = paddle2Y;
+      paddle1Velocity = 0.0; paddle2Velocity = 0.0;
       consecutiveHits = 0; currentSpeedLevel = 1;
       resetMainBall(1.0);
+      scheduleArcadeTimers();
+      lastPhysicsUpdate = millis();
 
       currentState = STATE_PLAY;
       return;
@@ -1370,6 +1429,78 @@ void headerHud() {
 }
 
 // ==========================================
+// V3.1: EFECTOS VISUALES DE IMPACTO
+// ==========================================
+void triggerImpactFX(int x, int y, int direction, uint8_t type, uint8_t strength) {
+  // Busca una ranura libre. Si no hay, reutiliza la más antigua.
+  int slot = -1;
+  for (int i = 0; i < MAX_IMPACT_FX; i++) {
+    if (!impactFX[i].active) { slot = i; break; }
+  }
+  if (slot < 0) slot = 0;
+
+  impactFX[slot].active = true;
+  impactFX[slot].x = constrain(x, 0, SCREEN_WIDTH - 1);
+  impactFX[slot].y = constrain(y, COURT_TOP_Y, SCREEN_HEIGHT - 1);
+  impactFX[slot].direction = (direction < 0) ? -1 : 1;
+  impactFX[slot].type = type;
+  impactFX[slot].frame = 0;
+
+  // El golpe a paleta hace que la pelota brille durante unos frames.
+  if (type == 1 || type == 2) {
+    for (int i = 0; i < 2; i++) {
+      if (balls[i].active && abs((int)balls[i].x - x) <= 4 && abs((int)balls[i].y - y) <= 8) {
+        ballFlashFrames[i] = 4 + strength;
+      }
+    }
+  }
+}
+
+void updateAndDrawImpactFX(int shakeOffset) {
+  for (int i = 0; i < MAX_IMPACT_FX; i++) {
+    if (!impactFX[i].active) continue;
+
+    ImpactFX &fx = impactFX[i];
+    int x = fx.x;
+    int y = fx.y + shakeOffset;
+
+    // Animación corta de 3 fases. En OLED monocromático el contraste
+    // se consigue aumentando el tamaño y la cantidad de píxeles.
+    if (fx.frame == 0) {
+      if (fx.type == 0) {
+        // Golpe contra techo/piso: una ráfaga grande en forma de estrella.
+        oledMonitor.drawFastHLine(max(0, x - 7), y, 15, WHITE);
+        oledMonitor.drawFastHLine(max(0, x - 4), y + fx.direction, 9, WHITE);
+        oledMonitor.drawPixel(x - 5, y + 2 * fx.direction, WHITE);
+        oledMonitor.drawPixel(x + 5, y + 2 * fx.direction, WHITE);
+      } else {
+        // Golpe a paleta: estrella de impacto junto a la pelota.
+        oledMonitor.drawFastHLine(max(0, x - 5), y, 11, WHITE);
+        oledMonitor.drawFastVLine(x, max(COURT_TOP_Y, y - 4), 9, WHITE);
+        oledMonitor.drawPixel(x - 4, y - 3, WHITE);
+        oledMonitor.drawPixel(x + 4, y + 3, WHITE);
+      }
+    } else if (fx.frame == 1) {
+      if (fx.type == 0) {
+        oledMonitor.drawFastHLine(max(0, x - 5), y, 11, WHITE);
+        oledMonitor.drawFastVLine(x, max(COURT_TOP_Y, y - 3), 7, WHITE);
+      } else {
+        oledMonitor.drawFastHLine(max(0, x - 7), y, 15, WHITE);
+        oledMonitor.drawPixel(x - 5, y - 3, WHITE);
+        oledMonitor.drawPixel(x + 5, y + 3, WHITE);
+      }
+    } else {
+      oledMonitor.drawPixel(x, y, WHITE);
+      oledMonitor.drawPixel(x - 2, y, WHITE);
+      oledMonitor.drawPixel(x + 2, y, WHITE);
+    }
+
+    fx.frame++;
+    if (fx.frame >= 3) fx.active = false;
+  }
+}
+
+// ==========================================
 //   MOTOR PRINCIPAL DEL JUEGO (STATE_PLAY)
 // ==========================================
 void handlePlay() {
@@ -1400,8 +1531,21 @@ void handlePlay() {
   }
 
   // 1. DIBUJAR LA CANCHA
-  for (int y = 0; y < SCREEN_HEIGHT; y += 6) {
+  // Línea central y bordes superior/inferior del área de juego.
+  // El HUD ocupa las primeras 12 filas del OLED, por eso la cancha comienza en Y=12.
+  for (int y = 13; y < SCREEN_HEIGHT; y += 6) {
     oledMonitor.drawFastVLine(64, y + shakeOffset, 3, WHITE);
+  }
+  oledMonitor.drawFastHLine(0, 12 + shakeOffset, SCREEN_WIDTH, WHITE);
+  oledMonitor.drawFastHLine(0, SCREEN_HEIGHT - 1 + shakeOffset, SCREEN_WIDTH, WHITE);
+
+  // Indicador visual de rebote contra techo/piso
+  if (wallFlashFrames > 0) {
+    int flashY = wallFlashY + shakeOffset;
+    int flashStartX = max(0, wallFlashX - 5);
+    int flashWidth = min(11, SCREEN_WIDTH - flashStartX);
+    oledMonitor.drawFastHLine(flashStartX, flashY, flashWidth, WHITE);
+    wallFlashFrames--;
   }
 
   // 2. MARCADORES E INDICADOR DE PODERES
@@ -1422,55 +1566,41 @@ void handlePlay() {
     oledMonitor.print("LVL "); oledMonitor.print(currentSpeedLevel);  
   }
 
-  // 3. MOVIMIENTO DE JUGADORES (J1 Y J2 / CPU)
-  int joy1Y = readJoystickY(); 
-  if (!invertedControlsP1) {
-    if (joy1Y < 1000) paddle1Y -= paddleSpeed;
-    if (joy1Y > 3000) paddle1Y += paddleSpeed;
-  } else { 
-    if (joy1Y < 1000) paddle1Y += paddleSpeed; 
-    if (joy1Y > 3000) paddle1Y -= paddleSpeed;
+  // 3. MOVIMIENTO DE JUGADORES (proporcional y con zona muerta)
+  unsigned long now = millis();
+  float physicsScale = 1.0;
+  if (lastPhysicsUpdate != 0) {
+    float elapsed = (float)(now - lastPhysicsUpdate);
+    physicsScale = constrain(elapsed / FRAME_REFERENCE_MS, 0.45f, 1.35f);
   }
+  lastPhysicsUpdate = now;
+
+  int joy1Y = readJoystickY();
+  lastPaddle1Y = paddle1Y;
+  updatePlayerPaddle(joy1Y, paddle1Y, currentPaddle1_H, invertedControlsP1, physicsScale);
+  paddle1Velocity = (paddle1Y - lastPaddle1Y) / max(physicsScale, 0.01f);
 
   int joy2Y = analogRead(J2_Y_PIN);
   if (gameMode == 1) {
-    if (invertControls) joy2Y = 4095 - joy2Y; 
-    if (!invertedControlsP2) {
-      if (joy2Y < 1000) paddle2Y -= paddleSpeed;
-      if (joy2Y > 3000) paddle2Y += paddleSpeed;
-    } else { 
-      if (joy2Y < 1000) paddle2Y += paddleSpeed;
-      if (joy2Y > 3000) paddle2Y -= paddleSpeed;
-    }
+    if (invertControls) joy2Y = JOY_MAX - joy2Y;
+    lastPaddle2Y = paddle2Y;
+    updatePlayerPaddle(joy2Y, paddle2Y, currentPaddle2_H, invertedControlsP2, physicsScale);
+    paddle2Velocity = (paddle2Y - lastPaddle2Y) / max(physicsScale, 0.01f);
   } else {
-    // IA CPU: Rastrea la pelota relevante
-    float targetY = 32;
-    if (balls[0].active && balls[1].active) {
-      targetY = (balls[0].x > balls[1].x) ? balls[0].y : balls[1].y;
-    } else if (balls[0].active) {
-      targetY = balls[0].y;
-    } else if (balls[1].active) {
-      targetY = balls[1].y;
-    }
-
-    float aiSpeedMultiplier = (gameDifficulty == 0) ? 0.4 : ((gameDifficulty == 1) ? 0.7 : 1.0);
-    if (!invertedControlsP2) {
-      if (paddle2Y + (currentPaddle2_H / 2) < targetY) paddle2Y += (paddleSpeed * aiSpeedMultiplier);
-      if (paddle2Y + (currentPaddle2_H / 2) > targetY) paddle2Y -= (paddleSpeed * aiSpeedMultiplier);
-    } else {
-      if (paddle2Y + (currentPaddle2_H / 2) < targetY) paddle2Y -= (paddleSpeed * aiSpeedMultiplier);
-      if (paddle2Y + (currentPaddle2_H / 2) > targetY) paddle2Y += (paddleSpeed * aiSpeedMultiplier);
-    }
+    lastPaddle2Y = paddle2Y;
+    updateCpuPaddle(physicsScale);
+    paddle2Velocity = (paddle2Y - lastPaddle2Y) / max(physicsScale, 0.01f);
   }
 
-  paddle1Y = constrain(paddle1Y, 0, SCREEN_HEIGHT - currentPaddle1_H);
-  paddle2Y = constrain(paddle2Y, 0, SCREEN_HEIGHT - currentPaddle2_H);
+  // Mantener las paletas dentro de la cancha.
+  paddle1Y = constrain(paddle1Y, (float)COURT_TOP_Y, (float)(COURT_BOTTOM_Y - currentPaddle1_H));
+  paddle2Y = constrain(paddle2Y, (float)COURT_TOP_Y, (float)(COURT_BOTTOM_Y - currentPaddle2_H));
 
   // 4. CAJAS MISTERIOSAS
-  if (!powerUpActive && activePowerUpType == -1 && millis() - powerUpSpawnTimer > random(10000, 15000)) {
+  if (!powerUpActive && activePowerUpType == -1 && millis() - powerUpSpawnTimer > powerUpSpawnDelay) {
     powerUpActive = true;
     powerUpX = random(30, 90); 
-    powerUpY = random(10, SCREEN_HEIGHT - 10);
+    powerUpY = random(COURT_TOP_Y + 2, COURT_BOTTOM_Y - 8);
     powerUpType = random(0, 5);
   }
 
@@ -1485,13 +1615,16 @@ void handlePlay() {
       if (balls[b].x + BALL_SIZE >= powerUpX && balls[b].x <= powerUpX + 6 && 
           balls[b].y + BALL_SIZE >= powerUpY && balls[b].y <= powerUpY + 6) {
           
-          powerUpActive = false;
-          playSFX(1800, 150); 
-          
-          if (lastPlayerToHit > 0) {
-            activePowerUpPlayer = lastPlayerToHit;
+          // Un poder solo se recoge si la pelota ya pertenece a un jugador.
+          // Así evitamos activar poderes sin dueño al comienzo de la partida.
+          if (balls[b].lastHitBy > 0) {
+            powerUpActive = false;
+            playSFX(1800, 150);
+            activePowerUpPlayer = balls[b].lastHitBy;
             activePowerUpType = powerUpType;
             powerUpDurationTimer = millis();
+            powerUpSpawnTimer = millis();
+            powerUpSpawnDelay = random(10000, 15001);
 
             if (powerUpType == 0) { 
               if (activePowerUpPlayer == 1) currentPaddle1_H = PADDLE_H * 2; else currentPaddle2_H = PADDLE_H * 2;
@@ -1499,7 +1632,7 @@ void handlePlay() {
               if (activePowerUpPlayer == 1) currentPaddle2_H = PADDLE_H / 2; else currentPaddle1_H = PADDLE_H / 2;
             } else if (powerUpType == 2) { 
               shakeFrames = 10;
-              balls[b].dx = (activePowerUpPlayer == 1) ? 6.0 : -6.0;
+              balls[b].dx = (activePowerUpPlayer == 1) ? BALL_MAX_SPEED : -BALL_MAX_SPEED;
             } else if (powerUpType == 3) { 
               ghostBallActive = true;
             } else if (powerUpType == 4) { 
@@ -1516,17 +1649,18 @@ void handlePlay() {
       ghostBallActive = false;
       invertedControlsP1 = false; invertedControlsP2 = false;
       activePowerUpType = -1;
-      powerUpSpawnTimer = millis(); 
+      powerUpSpawnTimer = millis();
+      powerUpSpawnDelay = random(10000, 15001);
       playSFX(400, 100); 
   }
 
   // 5. ZONA PORTAL
-  if (!activePortal.active && millis() - nextPortalTimer > random(8000, 15000)) {
+  if (!activePortal.active && millis() - nextPortalTimer > portalSpawnDelay) {
     activePortal.active = true;
-    activePortal.x = random(52, 72); 
-    activePortal.y = random(8, SCREEN_HEIGHT - 20);
+    activePortal.x = random(52, 72);
     activePortal.w = 6;
     activePortal.h = 16;
+    activePortal.y = random(COURT_TOP_Y + 1, COURT_BOTTOM_Y - activePortal.h - 1);
     activePortal.spawnTime = millis();
   }
 
@@ -1534,6 +1668,7 @@ void handlePlay() {
     if (millis() - activePortal.spawnTime > 6000) {
       activePortal.active = false;
       nextPortalTimer = millis();
+      portalSpawnDelay = random(8000, 15001);
     } else {
       if ((millis() / 100) % 2 == 0) {
         oledMonitor.drawRect(activePortal.x, activePortal.y + shakeOffset, activePortal.w, activePortal.h, WHITE);
@@ -1572,39 +1707,67 @@ void handlePlay() {
   for (int i = 0; i < 2; i++) {
     if (!balls[i].active) continue;
 
-    // Movimiento y curva
-    balls[i].dy += balls[i].spin;
-    balls[i].dy = constrain(balls[i].dy, -4.0, 4.0);
-    balls[i].x += balls[i].dx;
-    balls[i].y += balls[i].dy;
+    // Movimiento y curva. Se normaliza al tiempo para que la jugabilidad
+    // no dependa tanto de la velocidad de refresco del OLED.
+    float previousX = balls[i].x;
+    balls[i].dy += balls[i].spin * physicsScale;
+    balls[i].dy = constrain(balls[i].dy, -MAX_VERTICAL_SPEED, MAX_VERTICAL_SPEED);
+    balls[i].x += balls[i].dx * physicsScale;
+    balls[i].y += balls[i].dy * physicsScale;
 
     // Colisión con Portal
     if (activePortal.active && 
         balls[i].x + BALL_SIZE >= activePortal.x && balls[i].x <= activePortal.x + activePortal.w &&
         balls[i].y + BALL_SIZE >= activePortal.y && balls[i].y <= activePortal.y + activePortal.h) {
       
-      balls[i].dx *= 1.4; 
-      balls[i].y = random(4, SCREEN_HEIGHT - 12); 
+      balls[i].dx *= 1.20;
+      balls[i].dx = constrain(balls[i].dx, -BALL_MAX_SPEED, BALL_MAX_SPEED);
+      balls[i].y = random(COURT_TOP_Y + 2, COURT_BOTTOM_Y - BALL_SIZE - 1); 
       activePortal.active = false;
       nextPortalTimer = millis();
+      portalSpawnDelay = random(8000, 15001);
       shakeFrames = 6;
       playSFX(2100, 100);
     }
 
-    // Rebote techo y piso
-    if (balls[i].y <= 0) {
-      balls[i].y = 1; balls[i].dy *= -1; balls[i].spin *= -0.5; playSFX(600, 15);
-    } else if (balls[i].y >= SCREEN_HEIGHT - BALL_SIZE) {
-      balls[i].y = SCREEN_HEIGHT - BALL_SIZE - 1; balls[i].dy *= -1; balls[i].spin *= -0.5; playSFX(600, 15);
+    // Rebote techo y piso: coinciden con los bordes visibles de la cancha.
+    const float BALL_TOP = COURT_TOP_Y;
+    const float BALL_BOTTOM = COURT_BOTTOM_Y - BALL_SIZE;
+    if (balls[i].y <= BALL_TOP) {
+      balls[i].y = BALL_TOP;
+      balls[i].dy = fabs(balls[i].dy);
+      balls[i].spin *= -0.5;
+      wallFlashX = (int)balls[i].x + BALL_SIZE / 2;
+      wallFlashY = 12;
+      wallFlashFrames = 4;
+      shakeFrames = max(shakeFrames, 2);
+      triggerImpactFX((int)balls[i].x + BALL_SIZE / 2, 13, -1, 0, 2);
+      playSFX(650, 35);
+    } else if (balls[i].y >= BALL_BOTTOM) {
+      balls[i].y = BALL_BOTTOM;
+      balls[i].dy = -fabs(balls[i].dy);
+      balls[i].spin *= -0.5;
+      wallFlashX = (int)balls[i].x + BALL_SIZE / 2;
+      wallFlashY = SCREEN_HEIGHT - 1;
+      wallFlashFrames = 4;
+      shakeFrames = max(shakeFrames, 2);
+      triggerImpactFX((int)balls[i].x + BALL_SIZE / 2, SCREEN_HEIGHT - 2, 1, 0, 2);
+      playSFX(650, 35);
     }
 
     // Colisión Paleta P1
-    if (balls[i].x <= (4 + PADDLE_W) && balls[i].y + BALL_SIZE >= paddle1Y && balls[i].y <= paddle1Y + currentPaddle1_H) {
+    const float P1_RIGHT = 4 + PADDLE_W;
+    if (balls[i].dx < 0 &&
+        balls[i].x <= P1_RIGHT &&
+        previousX >= P1_RIGHT &&
+        balls[i].y + BALL_SIZE >= paddle1Y &&
+        balls[i].y <= paddle1Y + currentPaddle1_H) {
       float hitPoint = (balls[i].y + (BALL_SIZE / 2.0)) - (paddle1Y + (currentPaddle1_H / 2.0));
       lastPlayerToHit = 1;
+      balls[i].lastHitBy = 1;
       
-      if (joy1Y < 1000) balls[i].spin = -0.12;
-      else if (joy1Y > 3000) balls[i].spin = 0.12;
+      if (joy1Y < 1000) balls[i].spin = -0.025;
+      else if (joy1Y > 3000) balls[i].spin = 0.025;
       else balls[i].spin = 0.0;
 
       consecutiveHits++;
@@ -1613,27 +1776,47 @@ void handlePlay() {
       }
       if (currentSpeedLevel == 3) shakeFrames = 5;
 
-      float speed = (currentSpeedLevel == 1) ? BALL_SPEED_LVL1 : ((currentSpeedLevel == 2) ? BALL_SPEED_LVL2 : BALL_SPEED_LVL3);
-      if (abs(hitPoint) > (currentPaddle1_H / 3.0)) { speed *= 1.25; shakeFrames = 4; playSFX(1800, 30); }
+      float speed = getCurrentBallSpeed();
+
+      // V3: los rallies largos aumentan ligeramente la tensión.
+      int rallyHits = min(consecutiveHits, RALLY_BONUS_CAP);
+      speed *= (1.0 + rallyHits * RALLY_SPEED_BONUS);
+
+      if (abs(hitPoint) > (currentPaddle1_H / 3.0)) {
+        speed *= 1.10;
+        shakeFrames = 4;
+        playSFX(1800, 30);
+      }
+      speed = constrain(speed, 1.5, BALL_MAX_SPEED);
 
       balls[i].dx = speed;
-      balls[i].dy = hitPoint * 0.25;
-      if (balls[i].dy > -0.1 && balls[i].dy < 0.1) balls[i].dy = (random(0, 2) == 0) ? 0.5 : -0.5;
+      balls[i].dy = calculateBounceY(balls[i].y, paddle1Y, currentPaddle1_H, paddle1Velocity);
+      if (fabs(balls[i].dy) < MIN_VERTICAL_SPEED) {
+        balls[i].dy = (balls[i].dy < 0) ? -MIN_VERTICAL_SPEED : MIN_VERTICAL_SPEED;
+      }
       balls[i].x = 4 + PADDLE_W;
-      playSFX(900 + (consecutiveHits * 20), 20);
+      triggerImpactFX((int)balls[i].x + BALL_SIZE, (int)(balls[i].y + BALL_SIZE / 2.0), 1, 1, 2);
+      shakeFrames = max(shakeFrames, (abs(hitPoint) > (currentPaddle1_H / 3.0)) ? 5 : 2);
+      playSFX(900 + (consecutiveHits * 20), 30);
     }
 
     // Colisión Paleta P2
-    if (balls[i].x + BALL_SIZE >= (124 - PADDLE_W) && balls[i].y + BALL_SIZE >= paddle2Y && balls[i].y <= paddle2Y + currentPaddle2_H) {
+    const float P2_LEFT = 124 - PADDLE_W;
+    if (balls[i].dx > 0 &&
+        balls[i].x + BALL_SIZE >= P2_LEFT &&
+        previousX + BALL_SIZE <= P2_LEFT &&
+        balls[i].y + BALL_SIZE >= paddle2Y &&
+        balls[i].y <= paddle2Y + currentPaddle2_H) {
       float hitPoint = (balls[i].y + (BALL_SIZE / 2.0)) - (paddle2Y + (currentPaddle2_H / 2.0));
       lastPlayerToHit = 2;
+      balls[i].lastHitBy = 2;
       
       if (gameMode == 1) {
-        if (joy2Y < 1000) balls[i].spin = -0.12;
-        else if (joy2Y > 3000) balls[i].spin = 0.12;
+        if (joy2Y < 1000) balls[i].spin = -0.025;
+        else if (joy2Y > 3000) balls[i].spin = 0.025;
         else balls[i].spin = 0.0;
       } else {
-        balls[i].spin = (gameDifficulty == 2) ? (random(-10, 11) / 100.0) : 0.0;
+        balls[i].spin = (gameDifficulty == 2) ? (random(-25, 26) / 1000.0) : 0.0;
       }
 
       consecutiveHits++;
@@ -1642,14 +1825,28 @@ void handlePlay() {
       }
       if (currentSpeedLevel == 3) shakeFrames = 5;
 
-      float speed = (currentSpeedLevel == 1) ? BALL_SPEED_LVL1 : ((currentSpeedLevel == 2) ? BALL_SPEED_LVL2 : BALL_SPEED_LVL3);
-      if (abs(hitPoint) > (currentPaddle2_H / 3.0)) { speed *= 1.25; shakeFrames = 4; playSFX(1800, 30); }
+      float speed = getCurrentBallSpeed();
+
+      // V3: los rallies largos aumentan ligeramente la tensión.
+      int rallyHits = min(consecutiveHits, RALLY_BONUS_CAP);
+      speed *= (1.0 + rallyHits * RALLY_SPEED_BONUS);
+
+      if (abs(hitPoint) > (currentPaddle2_H / 3.0)) {
+        speed *= 1.10;
+        shakeFrames = 4;
+        playSFX(1800, 30);
+      }
+      speed = constrain(speed, 1.5, BALL_MAX_SPEED);
 
       balls[i].dx = -speed;
-      balls[i].dy = hitPoint * 0.25;
-      if (balls[i].dy > -0.1 && balls[i].dy < 0.1) balls[i].dy = (random(0, 2) == 0) ? 0.5 : -0.5;
+      balls[i].dy = calculateBounceY(balls[i].y, paddle2Y, currentPaddle2_H, paddle2Velocity);
+      if (fabs(balls[i].dy) < MIN_VERTICAL_SPEED) {
+        balls[i].dy = (balls[i].dy < 0) ? -MIN_VERTICAL_SPEED : MIN_VERTICAL_SPEED;
+      }
       balls[i].x = 124 - PADDLE_W - BALL_SIZE;
-      playSFX(900 + (consecutiveHits * 20), 20);
+      triggerImpactFX((int)balls[i].x, (int)(balls[i].y + BALL_SIZE / 2.0), -1, 2, 2);
+      shakeFrames = max(shakeFrames, (abs(hitPoint) > (currentPaddle2_H / 3.0)) ? 5 : 2);
+      playSFX(900 + (consecutiveHits * 20), 30);
     }
 
     // Anotación de punto
@@ -1672,11 +1869,19 @@ void handlePlay() {
       consecutiveHits = 0; currentSpeedLevel = 1;
       activePortal.active = false;
       nextPortalTimer = millis();
+      portalSpawnDelay = random(8000, 15001);
 
       powerUpActive = false; activePowerUpType = -1; lastPlayerToHit = 0;
       currentPaddle1_H = PADDLE_H; currentPaddle2_H = PADDLE_H;
       ghostBallActive = false; invertedControlsP1 = false; invertedControlsP2 = false;
       powerUpSpawnTimer = millis();
+      powerUpSpawnDelay = random(10000, 15001);
+      lastPhysicsUpdate = millis();
+
+      paddle1Velocity = 0.0;
+      paddle2Velocity = 0.0;
+      lastPaddle1Y = paddle1Y;
+      lastPaddle2Y = paddle2Y;
 
       stateTimer = millis();
       currentState = STATE_POINT_SCORED;
@@ -1685,12 +1890,28 @@ void handlePlay() {
 
     // Dibujar pelota
     if (!ghostBallActive || (ghostBallActive && (millis() / 200) % 2 == 0)) {
-      oledMonitor.fillRect((int)balls[i].x, (int)balls[i].y + shakeOffset, BALL_SIZE, BALL_SIZE, WHITE);
+      int bx = (int)balls[i].x;
+      int by = (int)balls[i].y + shakeOffset;
+      oledMonitor.fillRect(bx, by, BALL_SIZE, BALL_SIZE, WHITE);
+
+      // Flash de impacto: hace que el jugador perciba claramente el contacto.
+      if (ballFlashFrames[i] > 0) {
+        oledMonitor.drawRect(bx - 2, by - 2, BALL_SIZE + 4, BALL_SIZE + 4, WHITE);
+        oledMonitor.drawPixel(bx - 3, by + 1, WHITE);
+        oledMonitor.drawPixel(bx + BALL_SIZE + 2, by + 1, WHITE);
+        oledMonitor.drawPixel(bx + 1, by - 3, WHITE);
+        oledMonitor.drawPixel(bx + 1, by + BALL_SIZE + 2, WHITE);
+        ballFlashFrames[i]--;
+      }
     }
   }
 
+  // 9.5 EFECTOS DE IMPACTO, encima de la pelota y la cancha.
+  updateAndDrawImpactFX(shakeOffset);
+
   // 10. COMPROBAR VICTORIA
   if (scoreP1 >= scoreLimit || scoreP2 >= scoreLimit) {
+    checkAndSaveHighScore(max(scoreP1, scoreP2));
     int winner = (scoreP1 >= scoreLimit) ? 1 : 2;
     if (gameMode == 0) { if (winner == 1) wins_1p_ia++; else wins_ia++; } 
     else { if (winner == 1) wins_p1_vs++; else wins_p2_vs++; }
@@ -1771,8 +1992,12 @@ void handleGameOver() {
     
     scoreP1 = 0; scoreP2 = 0;
     paddle1Y = 24; paddle2Y = 24;
+    lastPaddle1Y = paddle1Y; lastPaddle2Y = paddle2Y;
+    paddle1Velocity = 0.0; paddle2Velocity = 0.0;
     consecutiveHits = 0; currentSpeedLevel = 1;
     resetMainBall(1.0);
+    scheduleArcadeTimers();
+    lastPhysicsUpdate = millis();
 
     if (gameOverOption == 0) {
       currentState = STATE_PLAY; 
@@ -1846,8 +2071,12 @@ void handlePause() {
       currentState = STATE_SETTINGS; 
     } else {
       scoreP1 = 0; scoreP2 = 0;
+      lastPaddle1Y = paddle1Y; lastPaddle2Y = paddle2Y;
+      paddle1Velocity = 0.0; paddle2Velocity = 0.0;
       consecutiveHits = 0; currentSpeedLevel = 1;
       resetMainBall(1.0);
+      scheduleArcadeTimers();
+      lastPhysicsUpdate = millis();
 
       animateScreenWipe();
       settingsReturnState = STATE_MENU; 
@@ -1859,10 +2088,114 @@ void handlePause() {
 // ==========================================
 // FUNCIONES AUXILIARES MULTIPELOTA
 // ==========================================
+float getCurrentBallSpeed() {
+  if (currentSpeedLevel == 1) return BALL_SPEED_LVL1;
+  if (currentSpeedLevel == 2) return BALL_SPEED_LVL2;
+  return BALL_SPEED_LVL3;
+}
+
+float calculateBounceY(float ballY, float paddleY, int paddleHeight, float paddleVelocity) {
+  float paddleCenter = paddleY + paddleHeight / 2.0;
+  float ballCenter = ballY + BALL_SIZE / 2.0;
+
+  // Ángulo base según el punto de impacto.
+  float relativeHit = (ballCenter - paddleCenter) / (paddleHeight / 2.0);
+  relativeHit = constrain(relativeHit, -1.0, 1.0);
+
+  float vertical = relativeHit * MAX_VERTICAL_SPEED;
+
+  // V3: si el jugador mueve la paleta mientras golpea,
+  // transmite parte de ese movimiento a la pelota.
+  vertical += paddleVelocity * PADDLE_INFLUENCE;
+
+  return constrain(vertical, -MAX_VERTICAL_SPEED, MAX_VERTICAL_SPEED);
+}
+
+void updatePlayerPaddle(int rawY, float &paddleY, int paddleHeight, bool inverted, float physicsScale) {
+  float error = (float)rawY - JOY_CENTER;
+  if (fabs(error) <= JOY_DEADZONE) return;
+
+  float normalized = (error > 0)
+      ? (error - JOY_DEADZONE) / (JOY_MAX - JOY_CENTER - JOY_DEADZONE)
+      : (error + JOY_DEADZONE) / (JOY_CENTER - JOY_MIN - JOY_DEADZONE);
+
+  normalized = constrain(normalized, -1.0f, 1.0f);
+
+  // Curva suave: pequeños movimientos son precisos y los extremos
+  // siguen permitiendo desplazamientos rápidos.
+  float curved = normalized * fabs(normalized);
+  float movement = curved * paddleSpeed * 1.55f * physicsScale;
+
+  if (inverted) movement = -movement;
+
+  paddleY += movement;
+  paddleY = constrain(paddleY, (float)COURT_TOP_Y, (float)(COURT_BOTTOM_Y - paddleHeight));
+}
+
+void updateCpuPaddle(float physicsScale) {
+  // Busca la pelota que realmente se aproxima a la CPU.
+  int targetIndex = -1;
+  float closestDistance = 9999.0;
+
+  for (int i = 0; i < 2; i++) {
+    if (!balls[i].active || balls[i].dx <= 0) continue;
+    float distance = (124 - PADDLE_W) - balls[i].x;
+    if (distance < closestDistance) {
+      closestDistance = distance;
+      targetIndex = i;
+    }
+  }
+
+  float targetY = SCREEN_HEIGHT / 2.0;
+  if (targetIndex >= 0) {
+    targetY = balls[targetIndex].y;
+
+    // En dificultad alta, anticipa aproximadamente dónde llegará la pelota.
+    if (gameDifficulty == 2 && balls[targetIndex].dx > 0.01) {
+      float projected = balls[targetIndex].y +
+                        balls[targetIndex].dy * (closestDistance / balls[targetIndex].dx);
+
+      // V3: pequeña variación para evitar una CPU matemáticamente perfecta.
+      projected += random(-10, 11) / 10.0f;
+      float minY = COURT_TOP_Y;
+      float maxY = COURT_BOTTOM_Y - BALL_SIZE;
+      float span = maxY - minY;
+      float period = span * 2.0;
+      float v = projected - minY;
+      v = fmod(v, period);
+      if (v < 0) v += period;
+      if (v > span) v = period - v;
+      targetY = minY + v;
+    }
+  }
+
+  float multiplier = (gameDifficulty == 0) ? 0.48f :
+                     (gameDifficulty == 1) ? 0.72f : 0.90f;
+  float center = paddle2Y + currentPaddle2_H / 2.0;
+  float error = targetY - center;
+  float deadzone = (gameDifficulty == 0) ? 3.0f : 1.2f;
+
+  if (fabs(error) > deadzone) {
+    float move = constrain(error, -paddleSpeed * multiplier * physicsScale, paddleSpeed * multiplier * physicsScale);
+    if (invertedControlsP2) move = -move;
+    paddle2Y += move;
+  }
+
+  paddle2Y = constrain(paddle2Y, (float)COURT_TOP_Y, (float)(COURT_BOTTOM_Y - currentPaddle2_H));
+}
+
+void scheduleArcadeTimers() {
+  powerUpSpawnTimer = millis();
+  powerUpSpawnDelay = random(10000, 15001);
+  nextPortalTimer = millis();
+  portalSpawnDelay = random(8000, 15001);
+}
+
 void resetMainBall(float dirX) {
   balls[0].x = 64;
   balls[0].y = 32;
   balls[0].spin = 0.0;
+  balls[0].lastHitBy = 0;
   balls[0].dx = (dirX >= 0 ? 1.0 : -1.0) * BALL_SPEED_LVL1;
   balls[0].dy = (random(0, 2) == 0 ? 1.5 : -1.5);
   balls[0].active = true;
@@ -1877,6 +2210,7 @@ void spawnSecondaryBall() {
     balls[1].dx = -balls[0].dx; 
     balls[1].dy = -balls[0].dy * 0.9;
     balls[1].spin = 0.0;
+    balls[1].lastHitBy = 0;
     balls[1].active = true;
     playSFX(1500, 150);
   }
