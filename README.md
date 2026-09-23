@@ -44,4 +44,4 @@ Asegúrate de instalar las siguientes librerías desde el Gestor de Librerías d
 
 1. Clona este repositorio:
    ```bash
-   git clone [https://github.com/TU_USUARIO/PinPong-Arcade-V4.git](https://github.com/TU_USUARIO/PinPong-Arcade-V4.git)
+   git clone [https://github.com/DAleGOC/Esp32-BitPongGame.git)
